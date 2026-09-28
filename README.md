@@ -2,7 +2,7 @@
 
 Verified-before-confirmed EVM/Solidity invariant fuzzing. CLI orchestrates Foundry, Medusa, Echidna, Halmos. Skill does the reasoning.
 
-![version](https://img.shields.io/badge/version-v2.2-blue)
+![version](https://img.shields.io/badge/version-v0.1-blue)
 ![tests](https://img.shields.io/badge/tests-127%20passing-brightgreen)
 ![python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
