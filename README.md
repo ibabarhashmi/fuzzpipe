@@ -126,15 +126,6 @@ fuzzpipe doctor
 
 `fuzzpipe doctor` prints the truth. Summary: `python3.11+` · `forge` required · `medusa`+`crytic-compile` / `echidna` optional (Tier-1) · `halmos` optional (Tier-2, eval-gated) · `slither` optional (dictionary seeds) · Node/`npx` for Hardhat only. Hardhat v2 and v3 supported (v3 needs `crytic-compile >= 0.4`).
 
-## Version history
-
-- **v0.2** — original, crashed on bool/array args, unguarded probes, silent triage drops, zero tests
-- **v2** — verified-before-confirmed: verdict gate, typed IR, tiered ladder, honest verdicts, 92 tests
-- **v2.1** — adversarial discovery, parallel campaigns, materiality FP gate, 119 tests
-- **v2.2** — complete coverage by construction (`gen-handlers`), hard coverage gate, canonical invariant library, 127 tests
-
-Each version fixed real bugs found by running the tool on live targets (Upside, PinLink, Chainlink).
-
 ## License
 
 MIT — see `LICENSE`.
