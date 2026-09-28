@@ -1,10 +1,17 @@
 from __future__ import annotations
 from typing import Optional
+import asyncio
+import shutil
 import typer
 from pathlib import Path
 
 from fuzzpipe.proc.runner import run_bounded
 from fuzzpipe.verdict.harm import asserts_harm
+
+
+def _run_sync(cmd, timeout, cwd=None, env=None):
+    r = asyncio.run(run_bounded(cmd, timeout, cwd=cwd, env=env))
+    return r.rc, r.stdout + r.stderr
 
 app = typer.Typer(name="materiality", help="sweep a reproducer across input scales: dust-only break => bad invariant (FP)")
 
@@ -71,7 +78,7 @@ def materiality(
     print(f"[fuzzpipe] Materiality sweep of `{test}` over {len(grid)} scales [{grid[0]} .. {grid[-1]}]; material threshold = {material_val}")
     results = []
     for m in grid:
-        rc, out = run_bounded(["forge", "test", "--match-test", test], budget, cwd=str(target_path), env={env: str(m)})
+        rc, out = _run_sync(["forge", "test", "--match-test", test], budget, cwd=str(target_path), env={env: str(m)})
         broke = _test_broke(out, test)
         results.append((m, broke))
         mark = "\033[31mBROKE\033[0m" if broke else ("\033[32mheld \033[0m" if broke is False else "\033[33m?    \033[0m")

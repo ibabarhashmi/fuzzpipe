@@ -285,8 +285,8 @@ fuzzpipe selftest        [-v]             # 127 tests, zero deps
 
 Environment (single `FUZZPIPE_*` namespace):
 - `FUZZPIPE_SYMBOLIC=1` → Halmos
-- `FUZZPIPE_EMIT_FINDINGS=1` → promote CONFIRMED to `output/`
 - `FUZZPIPE_SWEEP_AMOUNT` → materiality sweep amount
+- `FUZZPIPE_LOG=json` → machine-readable logs
 
 ---
 

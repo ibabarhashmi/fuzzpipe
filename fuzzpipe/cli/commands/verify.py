@@ -1,9 +1,10 @@
 from __future__ import annotations
 from typing import Optional
+import asyncio
+import shutil
 import typer
 from pathlib import Path
 
-from fuzzpipe.proc.runner import run_bounded
 from fuzzpipe.verdict.gate import lower_and_verify
 
 app = typer.Typer(name="verify", help="verdict gate on one PoC: compile+reproduce+harm -> CONFIRMED/SUSPECTED")
@@ -30,7 +31,8 @@ def verify(
         raise typer.Exit(2)
 
     import asyncio
-    v, reason, out = asyncio.run(lower_and_verify(target_path, src, test_name, marker_val))
+    res = asyncio.run(lower_and_verify(target_path, src, test_name, marker_val))
+    v, reason, out = res.verdict.value, res.reason, res.output
     (target_path / ".fuzzpipe" / "poc").mkdir(parents=True, exist_ok=True)
     (target_path / ".fuzzpipe" / "poc" / "last_verdict.log").write_text((out or "")[-8000:])
     if v == "CONFIRMED":

@@ -491,7 +491,7 @@ def _scan_solidity_surface(target: Path, pt: str, override: Optional[str] = None
     _VAR_RE = _re.compile(
         r"\b(?:uint\d*|int\d*|address|bool|bytes\d*|string|mapping\s*\([^)]*\))\s+public\s+"
         r"(?:constant\s+|immutable\s+)?(\w+)")
-    src_dirs = [_recon_dir(target, pt).parent / "src"] if pt == "foundry" else [_recon_dir(target, pt).parent / "contracts"]
+    src_dirs = [Path(target) / "src"] if pt == "foundry" else [Path(target) / "contracts"]
     if override:
         src_dirs = [Path(target) / override]
     for base in src_dirs:

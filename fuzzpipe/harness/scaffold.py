@@ -4,20 +4,40 @@ import json
 import shutil
 from pathlib import Path
 
-from fuzzpipe.proc.runner import run_bounded
+from fuzzpipe.proc.runner import run_bounded, RC_MISSING
 from fuzzpipe.core.state import state_dir, load_state, save_state, set_stage
 from fuzzpipe.engines.sharding import _tester_rel_path, _disable_slither_for_hh3, _hardhat_major
+import asyncio
+
+
+def _run_sync(cmd, timeout, cwd=None):
+    """Sync wrapper: run cmd under wall-clock bound, return (rc, output)."""
+    r = asyncio.run(run_bounded(cmd, timeout, cwd=cwd))
+    return r.rc, r.stdout + r.stderr
 
 
 def _compile_harness(target: Path, pt: str, timeout: int = 600) -> int:
     if pt == "hardhat" and shutil.which("npx"):
-        run_bounded(["npx", "hardhat", "compile"], timeout, cwd=str(target), stream=False)
+        _run_sync(["npx", "hardhat", "compile"], timeout, cwd=str(target))
     if shutil.which("forge"):
-        code, _ = run_bounded(["forge", "build"], timeout, cwd=str(target), stream=False)
+        code, _ = _run_sync(["forge", "build"], timeout, cwd=str(target))
         return code
     print(f"[warn] forge not installed - the engines need the Foundry compile layer. Install: {TOOLS['forge'][1]}")
-    from fuzzpipe.proc.runner import RC_MISSING
     return RC_MISSING
+
+
+def _ladder_budgets(target: Path, tier1_override=None) -> dict:
+    """Per-tier wall-clock budgets (seconds) from config, else defaults 60/600/900."""
+    cfg = {}
+    f = state_dir(target) / "config.json"
+    if f.exists():
+        try:
+            cfg = (json.loads(f.read_text()).get("budgets") or {})
+        except Exception:
+            cfg = {}
+    return {0: int(cfg.get("tier0", 60)),
+            1: int(tier1_override or cfg.get("tier1", 600)),
+            2: int(cfg.get("tier2", 900))}
 
 
 DEFAULT_MEDUSA_WORKERS = 8
@@ -102,18 +122,18 @@ def _ensure_chimera_lib(target: Path, offline: bool = False) -> bool:
         if offline:
             return (target / "lib" / "chimera").exists()
         if shutil.which("forge"):
-            code, _ = run_bounded(["forge", "install", "Recon-Fuzz/chimera", "--no-git"], 120, cwd=str(target))
+            code, _ = _run_sync(["forge", "install", "Recon-Fuzz/chimera", "--no-git"], 120, cwd=str(target))
             if code != 0:
-                code, _ = run_bounded(["forge", "install", "Recon-Fuzz/chimera"], 120, cwd=str(target))
+                code, _ = _run_sync(["forge", "install", "Recon-Fuzz/chimera"], 120, cwd=str(target))
         else:
-            code, _ = run_bounded(["git", "clone", "--depth", "1", "https://github.com/Recon-Fuzz/chimera", "lib/chimera"], 120, cwd=str(target))
+            code, _ = _run_sync(["git", "clone", "--depth", "1", "https://github.com/Recon-Fuzz/chimera", "lib/chimera"], 120, cwd=str(target))
         if code != 0 or not (target / "lib" / "chimera").exists():
             return False
     if not (target / "lib" / "setup-helpers").exists() and not offline:
         if shutil.which("forge"):
-            run_bounded(["forge", "install", "Recon-Fuzz/setup-helpers", "--no-git"], 120, cwd=str(target))
+            _run_sync(["forge", "install", "Recon-Fuzz/setup-helpers", "--no-git"], 120, cwd=str(target))
         else:
-            run_bounded(["git", "clone", "--depth", "1", "https://github.com/Recon-Fuzz/setup-helpers", "lib/setup-helpers"], 120, cwd=str(target))
+            _run_sync(["git", "clone", "--depth", "1", "https://github.com/Recon-Fuzz/setup-helpers", "lib/setup-helpers"], 120, cwd=str(target))
     return True
 
 
@@ -311,7 +331,7 @@ def _ensure_hardhat_foundry_plugin(target: Path) -> int:
     else:
         install = ["npm", "install", "--save-dev", "@nomicfoundation/hardhat-foundry@^1.1.0"]
     if not (target / "node_modules" / "@nomicfoundation" / "hardhat-foundry").exists():
-        code, _ = run_bounded(install, 120, cwd=str(target))
+        code, _ = _run_sync(install, 120, cwd=str(target))
         if code != 0:
             print("[warn] could not install @nomicfoundation/hardhat-foundry. Install manually:")
             print("  " + " ".join(install))

@@ -80,8 +80,8 @@ fuzzpipe selftest        [-v]             # regression suite (zero deps)
 | Variable | Effect |
 |----------|--------|
 | `FUZZPIPE_SYMBOLIC` | `=1` enables Halmos (Tier-2). Off by default. |
-| `FUZZPIPE_EMIT_FINDINGS` | `=1` promotes CONFIRMED to `output/`. |
 | `FUZZPIPE_SWEEP_AMOUNT` | set by `materiality` sweep. |
+| `FUZZPIPE_LOG` | `=json` for machine-readable logs. |
 
 Read in one place. `test_consistency` enforces docs = code.
 

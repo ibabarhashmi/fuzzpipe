@@ -52,8 +52,8 @@ def _env_tokens(text):
 
 class TestEnvNoDrift(unittest.TestCase):
     def test_code_and_docs_agree_on_env_vars(self):
-        code_text = "\n".join(p.read_text() for p in
-                              [ROOT / "cli" / "fuzzpipe"] + list((ROOT / "cli").glob("*.py")))
+        code_files = [ROOT / "cli" / "fuzzpipe"] + list((ROOT / "cli").glob("*.py")) + list((ROOT / "fuzzpipe").rglob("*.py"))
+        code_text = "\n".join(p.read_text() for p in code_files if p.exists())
         code_env = _env_tokens(code_text)
         doc_env = _env_tokens(SKILL.read_text()) | _env_tokens(README.read_text() if README.exists() else "")
         self.assertTrue(code_env, "no FUZZPIPE_* env vars found in code")

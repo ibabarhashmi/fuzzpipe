@@ -4,6 +4,10 @@ import typer
 from pathlib import Path
 
 from fuzzpipe.harness.scaffold import state_dir
+from fuzzpipe.harness.coverage import (
+    _cov_in_scope, _coverage_scan, _uncovered_functions,
+    _overall_pct, _cov_waived,
+)
 from fuzzpipe.harness.config_gen import write_medusa_config, write_echidna_config
 
 app = typer.Typer(name="coverage", help="per-function coverage + uncovered-entry-point flags")
@@ -38,7 +42,7 @@ def coverage(
             except Exception:
                 pass
 
-    from fuzzpipe.harness.scaffold import _cov_in_scope, _coverage_scan, _uncovered_functions, _overall_pct, _cov_waived
+    from fuzzpipe.harness.coverage import _cov_in_scope, _coverage_scan, _uncovered_functions, _overall_pct, _cov_waived
     scope, msg = _coverage_scan(target_path, engine)
     if scope is None:
         if "in-scope" in msg:

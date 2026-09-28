@@ -1,5 +1,7 @@
 from __future__ import annotations
 from typing import Optional
+import asyncio
+import shutil
 import typer
 from pathlib import Path
 
@@ -8,6 +10,11 @@ from fuzzpipe.verdict import render_reproducer_contract
 from fuzzpipe import medusa_parse
 from fuzzpipe.proc.runner import run_bounded
 from fuzzpipe.verdict.gate import lower_and_verify
+
+
+def _run_sync(cmd, timeout, cwd=None, env=None):
+    r = asyncio.run(run_bounded(cmd, timeout, cwd=cwd, env=env))
+    return r.rc, r.stdout + r.stderr
 
 app = typer.Typer(name="triage", help="broken sequences -> type-aware reproducer + verdict gate")
 
@@ -51,11 +58,11 @@ def triage(
     # verdict gate
     if shutil.which("forge"):
         print("[fuzzpipe] Re-executing reproducers (verdict gate)...")
-        rc, out = run_bounded(["forge", "build"], 180, cwd=str(target_path))
+        rc, out = _run_sync(["forge", "build"], 180, cwd=str(target_path))
         if rc != 0:
             print("[warn] reproducer did not compile -> SUSPECTED (fix the harness/rendering, or the sequence is unrenderable).")
             raise typer.Exit(0)
-        rc, out = run_bounded(["forge", "test", "--match-test", "test_repro", "-vv"], 300, cwd=str(target_path))
+        rc, out = _run_sync(["forge", "test", "--match-test", "test_repro", "-vv"], 300, cwd=str(target_path))
         broke = "[FAIL" in (out or "")
         if broke:
             print("[ok] Reproducer triggered a break. Now add the HARM assertion, then `fuzzpipe verify` "
@@ -70,7 +77,6 @@ def triage(
 
 
 def _collect_medusa_sequences(target: Path):
-    from fuzzpipe.engines.sharding import _medusa_results_dirs
     sequences, warnings = [], []
     for d in _medusa_results_dirs(target):
         seqs, warns = medusa_parse.failing_sequences(d)

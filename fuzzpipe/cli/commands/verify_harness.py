@@ -1,10 +1,13 @@
 from __future__ import annotations
 from typing import Optional
+import asyncio
 import shutil
 import typer
 from pathlib import Path
 
-from fuzzpipe.harness.scaffold import _project_type, _tester_rel_path
+from fuzzpipe.harness.scaffold import _project_type
+from fuzzpipe.engines.config import _tester_rel_path
+from fuzzpipe.proc.runner import run_bounded
 
 app = typer.Typer(name="verify-harness", help="preflight: assert the engine discovers the harness")
 
@@ -24,7 +27,8 @@ def verify_harness(
     else:
         print(f"[ok] harness entrypoint present: {tester.relative_to(target_path)}")
     if shutil.which("forge"):
-        code, out = run_bounded(["forge", "build"], 600, cwd=str(target_path))
+        r = asyncio.run(run_bounded(["forge", "build"], 600, cwd=str(target_path)))
+        code, out = r.rc, r.stdout + r.stderr
         if code != 0:
             problems.append("forge build failed - the engine would not compile this harness")
         else:

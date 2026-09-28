@@ -97,7 +97,7 @@ def _approved_or_candidate_ids(target: Path) -> list[str]:
     return [i.id for i in invs if i.status == "candidate"]
 
 
-def stage_shard_config(target: Path, inv_id: str, depth: int, limit: int, pt: str, workers: int | None = None) -> Path:
+def stage_shard_config(target: Path, inv_id: str, depth: int, limit: int, pt: str = "foundry", workers: int | None = None) -> Path:
     out = state_dir(target) / "medusa" / (inv_id + ".json")
     out.parent.mkdir(parents=True, exist_ok=True)
     corpus = str(state_dir(target) / "corpus" / "medusa" / inv_id)
@@ -122,7 +122,8 @@ def _write_echidna_config(target: Path, depth: int, limit: int, force: bool = Fa
     return cfg
 
 
-def _recon_dir(target: Path, pt: str) -> Path:
+def _recon_dir(target, pt: str) -> Path:
+    target = Path(target)
     if pt == "hardhat":
         return target / "contracts" / "recon"
     return target / "test" / "recon"

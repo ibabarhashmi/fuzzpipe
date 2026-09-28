@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import Optional
 import typer
+from pathlib import Path
 
 from fuzzpipe.harness.handlers import generate_handlers
 
