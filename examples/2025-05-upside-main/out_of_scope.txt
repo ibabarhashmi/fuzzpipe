@@ -1,3 +1,0 @@
-./contracts/UpsideStaking.sol
-./contracts/UpsideStakingStub.sol
-./contracts/mock/USDCMock.sol
