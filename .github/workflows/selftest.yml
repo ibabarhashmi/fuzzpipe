@@ -1,0 +1,33 @@
+name: fuzzpipe selftest
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  selftest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.9", "3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # forge lets the verdict-gate (R7), harness-discovery (R5) and the E2E pipeline tests actually
+      # re-execute. It is REQUIRED by the pipeline, so CI must FAIL — not silently skip — if it is
+      # absent, otherwise a broken verdict gate could pass CI as "skipped".
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Assert forge is present (fail, don't skip)
+        run: forge --version
+
+      - name: Run the regression suite
+        run: python3 cli/fuzzpipe selftest --verbose

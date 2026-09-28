@@ -1,0 +1,7 @@
+[profile.default]
+src = "contracts"
+out = "out"
+libs = ["lib", "node_modules"]
+test = "test"
+solc = "0.8.24"
+evm_version = "cancun"

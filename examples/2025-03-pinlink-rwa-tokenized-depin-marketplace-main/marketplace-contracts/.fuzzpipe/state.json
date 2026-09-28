@@ -1,0 +1,28 @@
+{
+  "project_type": "foundry",
+  "updated": "2026-07-04T12:41:52.660127+00:00",
+  "stage": "4-run",
+  "history": [
+    {
+      "stage": "0-init",
+      "at": "2026-07-04T12:41:45.607698+00:00",
+      "mode": "unset",
+      "project_type": "foundry"
+    },
+    {
+      "stage": "3-verify-harness",
+      "at": "2026-07-04T12:41:45.772733+00:00",
+      "harness_ready": true
+    },
+    {
+      "stage": "4-run",
+      "at": "2026-07-04T12:41:52.659898+00:00",
+      "engine": "medusa",
+      "result": "clean"
+    }
+  ],
+  "mode": "unset",
+  "harness_ready": true,
+  "engine": "medusa",
+  "result": "clean"
+}

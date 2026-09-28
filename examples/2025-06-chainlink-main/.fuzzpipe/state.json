@@ -1,0 +1,14 @@
+{
+  "project_type": "foundry",
+  "updated": "2026-07-04T13:03:04.851773+00:00",
+  "stage": "0-init",
+  "history": [
+    {
+      "stage": "0-init",
+      "at": "2026-07-04T13:03:04.851749+00:00",
+      "mode": "unset",
+      "project_type": "foundry"
+    }
+  ],
+  "mode": "unset"
+}

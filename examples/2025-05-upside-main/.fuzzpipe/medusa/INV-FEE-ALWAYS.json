@@ -1,0 +1,38 @@
+{
+  "fuzzing": {
+    "workers": 8,
+    "testLimit": 500000,
+    "callSequenceLength": 64,
+    "corpusDirectory": "/Users/babar/Downloads/QuillAudits_Fuzzing-QuillAudits-Fuzzing-v2.1/examples/2025-05-upside-main/.fuzzpipe/corpus/medusa/INV-FEE-ALWAYS",
+    "deploymentOrder": [
+      "CryticTester"
+    ],
+    "targetContracts": [
+      "CryticTester"
+    ],
+    "testChainConfig": {
+      "codeSizeCheckDisabled": true
+    }
+  },
+  "compilation": {
+    "platform": "crytic-compile",
+    "platformConfig": {
+      "target": "/Users/babar/Downloads/QuillAudits_Fuzzing-QuillAudits-Fuzzing-v2.1/examples/2025-05-upside-main/test/recon/CryticTester.sol",
+      "solcVersion": ""
+    }
+  },
+  "testing": {
+    "stopOnFailedTest": true,
+    "testAllContracts": false,
+    "assertionTesting": {
+      "enabled": true
+    },
+    "propertyTesting": {
+      "enabled": true,
+      "testPrefix": "property_"
+    },
+    "optimizationTesting": {
+      "enabled": false
+    }
+  }
+}

@@ -1,0 +1,189 @@
+{
+  "invariants": [
+    {
+      "id": "INV-SOLVENCY-LT",
+      "statement": "protocol USDC balance >= claimableProtocolFees + (ltReserves - INITIAL)",
+      "category": "solvency",
+      "shape": "SAFETY",
+      "scope": "global",
+      "predicate": {
+        "expr": "usdc.balanceOf(protocol) >= fees + (ltRes - INITIAL)"
+      },
+      "priority": "P0",
+      "targets": [
+        "UpsideProtocol.swap",
+        "UpsideProtocol.claimProtocolFees"
+      ],
+      "tolerance": "",
+      "derived_via": "proc 3 (conservation)",
+      "source": "discovered",
+      "severity_if_broken": "critical",
+      "tier_hint": 1,
+      "status": "NO-CE-IN-BUDGET"
+    },
+    {
+      "id": "INV-SOLVENCY-MC",
+      "statement": "protocol MetaCoin balance >= metaCoinReserves + unclaimed deployer fees",
+      "category": "solvency",
+      "shape": "SAFETY",
+      "scope": "global",
+      "predicate": {
+        "expr": "metaCoin.balanceOf(protocol) >= mcRes + deployerFees"
+      },
+      "priority": "P0",
+      "targets": [
+        "UpsideProtocol.swap",
+        "UpsideProtocol.claimDeployerFees"
+      ],
+      "tolerance": "",
+      "derived_via": "proc 3 (conservation)",
+      "source": "discovered",
+      "severity_if_broken": "critical",
+      "tier_hint": 1,
+      "status": "NO-CE-IN-BUDGET"
+    },
+    {
+      "id": "INV-RESERVES-FLOOR",
+      "statement": "liquidityTokenReserves never drops below INITIAL",
+      "category": "valid-state",
+      "shape": "SAFETY",
+      "scope": "guard",
+      "predicate": {
+        "expr": "ltRes >= INITIAL"
+      },
+      "priority": "P1",
+      "targets": [
+        "UpsideProtocol.swap"
+      ],
+      "tolerance": "",
+      "derived_via": "proc 1 (per-variable floor)",
+      "source": "discovered",
+      "severity_if_broken": "high",
+      "tier_hint": 0,
+      "status": "NO-CE-IN-BUDGET"
+    },
+    {
+      "id": "INV-FEE-ALWAYS",
+      "statement": "a buy that produces nonzero output always charges a nonzero protocol fee",
+      "category": "anti-property",
+      "shape": "CORRECTNESS",
+      "scope": "economic",
+      "predicate": {
+        "expr": "out > 0 => fees increase"
+      },
+      "priority": "P2",
+      "targets": [
+        "UpsideProtocol.swap",
+        "UpsideProtocol.processSwapFee"
+      ],
+      "tolerance": "",
+      "derived_via": "proc 8 (docs/NatSpec mining)",
+      "source": "discovered",
+      "severity_if_broken": "low",
+      "tier_hint": 1,
+      "status": "CONFIRMED"
+    },
+    {
+      "id": "INV-NONZERO-OUTPUT",
+      "statement": "a sell of a nonzero MetaCoin amount that does not revert must return >0 liquidity token (no value absorbed) [TRIAGE: reproduces only for DUST (<~1e-8 of a token) -> classified BAD-INVARIANT (expected AMM rounding), NOT a real bug; no documented-intent violation]",
+      "category": "anti-property",
+      "shape": "CORRECTNESS",
+      "scope": "economic",
+      "predicate": {
+        "expr": "sell(amount>0) => amountOut > 0"
+      },
+      "priority": "P2",
+      "targets": [
+        "UpsideProtocol.swap"
+      ],
+      "tolerance": "",
+      "derived_via": "persona:first-depositor + persona:griefer (Stage 2b)",
+      "source": "threat-model",
+      "severity_if_broken": "low",
+      "tier_hint": 1,
+      "status": "SUSPECTED"
+    },
+    {
+      "id": "INV-K-MONOTONIC",
+      "statement": "the constant product ltReserves*mcReserves never decreases across a swap",
+      "category": "stateful-sequence",
+      "shape": "CORRECTNESS",
+      "scope": "economic",
+      "predicate": {
+        "expr": "k_after >= k_before"
+      },
+      "priority": "P1",
+      "targets": [
+        "UpsideProtocol.swap"
+      ],
+      "tolerance": "",
+      "derived_via": "persona:MEV + persona:flash-loan (Stage 2b)",
+      "source": "threat-model",
+      "severity_if_broken": "high",
+      "tier_hint": 1,
+      "status": "NO-CE-IN-BUDGET"
+    },
+    {
+      "id": "INV-CROSS-COIN-ISOLATION",
+      "statement": "operations on one MetaCoin never change another MetaCoin's reserves",
+      "category": "anti-property",
+      "shape": "SAFETY",
+      "scope": "cross_contract",
+      "predicate": {
+        "expr": "untraded coin2 reserves == tokenize defaults"
+      },
+      "priority": "P1",
+      "targets": [
+        "UpsideProtocol.swap",
+        "UpsideProtocol.withdrawLiquidity"
+      ],
+      "tolerance": "",
+      "derived_via": "persona:reentrancy-composer (Stage 2b)",
+      "source": "threat-model",
+      "severity_if_broken": "high",
+      "tier_hint": 1,
+      "status": "NO-CE-IN-BUDGET"
+    },
+    {
+      "id": "INV-WITHDRAW-NO-BRICK-SELLS",
+      "statement": "after the owner runs withdrawLiquidity, a holder can still sell their MetaCoins for >0",
+      "category": "anti-property",
+      "shape": "LIVENESS",
+      "scope": "guard",
+      "predicate": {
+        "expr": "post-withdraw sell does not revert / returns > 0"
+      },
+      "priority": "P1",
+      "targets": [
+        "UpsideProtocol.withdrawLiquidity",
+        "UpsideProtocol.swap"
+      ],
+      "tolerance": "",
+      "derived_via": "persona:malicious-admin (Stage 2b)",
+      "source": "threat-model",
+      "severity_if_broken": "high",
+      "tier_hint": 0,
+      "status": "UNTESTED"
+    },
+    {
+      "id": "INV-URL-NO-FRONTRUN",
+      "statement": "a URL tokenization cannot be front-run to steal the deployer position (audit finding [01])",
+      "category": "anti-property",
+      "shape": "AUTHORIZATION",
+      "scope": "guard",
+      "predicate": {
+        "expr": "intended registrant owns the URL"
+      },
+      "priority": "P2",
+      "targets": [
+        "UpsideProtocol.tokenize"
+      ],
+      "tolerance": "",
+      "derived_via": "persona:MEV + persona:griefer (Stage 2b)",
+      "source": "threat-model",
+      "severity_if_broken": "medium",
+      "tier_hint": 0,
+      "status": "UNTESTED"
+    }
+  ]
+}

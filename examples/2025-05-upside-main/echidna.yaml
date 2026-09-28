@@ -1,0 +1,5 @@
+testMode: assertion
+testLimit: 500000
+seqLen: 64
+corpusDir: .fuzzpipe/corpus/echidna
+coverage: true

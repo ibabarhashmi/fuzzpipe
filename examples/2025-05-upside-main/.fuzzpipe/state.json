@@ -1,0 +1,101 @@
+{
+  "project_type": "foundry",
+  "updated": "2026-07-07T22:47:03.160489+00:00",
+  "stage": "3-gen-handlers",
+  "history": [
+    {
+      "stage": "0-init",
+      "at": "2026-07-04T13:10:37.162521+00:00",
+      "mode": "unset",
+      "project_type": "foundry"
+    },
+    {
+      "stage": "1-scaffold",
+      "at": "2026-07-04T13:10:54.734900+00:00",
+      "harness": "/Users/babar/Downloads/QuillAudits_Fuzzing-QuillAudits-Fuzzing-v2.1/examples/2025-05-upside-main/test/recon",
+      "project_type": "foundry",
+      "chimera": true
+    },
+    {
+      "stage": "3-verify-harness",
+      "at": "2026-07-04T13:14:21.415281+00:00",
+      "harness_ready": true
+    },
+    {
+      "stage": "4-run",
+      "at": "2026-07-04T13:15:45.315468+00:00",
+      "ladder": {
+        "foundry(t0)": "clean",
+        "medusa:INV-SOLVENCY-LT(t1)": "break_or_error",
+        "medusa:INV-SOLVENCY-MC(t1)": "break_or_error",
+        "medusa:INV-RESERVES-FLOOR(t1)": "break_or_error",
+        "medusa:INV-FEE-ALWAYS(t1)": "break_or_error",
+        "echidna(t1)": "clean"
+      }
+    },
+    {
+      "stage": "5-triage",
+      "at": "2026-07-04T13:16:35.514300+00:00",
+      "triage": "native_ok",
+      "reproducers": 20
+    },
+    {
+      "stage": "5-verify",
+      "at": "2026-07-04T13:18:27.693294+00:00",
+      "verdict": "CONFIRMED",
+      "ce": "INV-FEE-ALWAYS"
+    },
+    {
+      "stage": "3-verify-harness",
+      "at": "2026-07-04T13:42:16.042751+00:00",
+      "harness_ready": true
+    },
+    {
+      "stage": "4-run",
+      "at": "2026-07-04T13:42:24.963651+00:00",
+      "engine": "medusa",
+      "result": "break_or_error"
+    },
+    {
+      "stage": "5-materiality",
+      "at": "2026-07-04T14:01:33.799353+00:00",
+      "test": "test_materiality_sell",
+      "verdict": "HELD"
+    },
+    {
+      "stage": "5-materiality",
+      "at": "2026-07-04T14:03:09.962760+00:00",
+      "test": "test_materiality_sell",
+      "verdict": "DUST-ONLY"
+    },
+    {
+      "stage": "3-gen-handlers",
+      "at": "2026-07-07T22:47:03.160275+00:00",
+      "generated": 12,
+      "stubs": 1,
+      "overrides": 2
+    }
+  ],
+  "mode": "unset",
+  "harness": "/Users/babar/Downloads/QuillAudits_Fuzzing-QuillAudits-Fuzzing-v2.1/examples/2025-05-upside-main/test/recon",
+  "chimera": true,
+  "harness_ready": true,
+  "ladder": {
+    "foundry(t0)": "clean",
+    "medusa:INV-SOLVENCY-LT(t1)": "break_or_error",
+    "medusa:INV-SOLVENCY-MC(t1)": "break_or_error",
+    "medusa:INV-RESERVES-FLOOR(t1)": "break_or_error",
+    "medusa:INV-FEE-ALWAYS(t1)": "break_or_error",
+    "echidna(t1)": "clean"
+  },
+  "triage": "native_ok",
+  "reproducers": 20,
+  "verdict": "DUST-ONLY",
+  "ce": "INV-FEE-ALWAYS",
+  "engine": "medusa",
+  "result": "break_or_error",
+  "test": "test_materiality_sell",
+  "generated": 12,
+  "stubs": 1,
+  "overrides": 2
+}

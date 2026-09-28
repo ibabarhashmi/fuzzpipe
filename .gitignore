@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+*.egg-info/
+dist/
+build/
+
+# Virtual envs
+venv/
+env/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project specific
+.kilo/
+*.log
+
+# Build artifacts
+out/
+cache/
+lib/
+
+# Node
+node_modules/
+yarn.lock
+package-lock.json
+
+# Coverage
+htmlcov/
+.coverage.*

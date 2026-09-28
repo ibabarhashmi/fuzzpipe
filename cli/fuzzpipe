@@ -1,0 +1,1887 @@
+#!/usr/bin/env python3
+"""
+fuzzpipe (v2.1) - deterministic orchestration CLI for AI-driven EVM/Solidity invariant fuzzing.
+
+DESIGN CONTRACT (do not break):
+  * MECHANICAL ONLY. Wraps existing tools (Foundry, Medusa, Echidna, Halmos, create-chimera-app)
+    and a native failing-sequence parser. Contains NO AI/LLM logic.
+  * The AI reasoning (invariant discovery, harness generation, triage judgment) lives in the
+    `fuzzpipe-fuzzing` skill, which CALLS this CLI. The CLI never calls the AI.
+  * Every subcommand is safe to run by a human OR an agent, and NEVER crashes on a missing tool
+    (a missing tool is diagnosed, not raised).
+
+v2.1 additions over v0.2:
+  * verdict gate: `verify`/`triage` lower a break to a Foundry PoC and re-execute it -> CONFIRMED
+    only if it compiles + reproduces the SPECIFIC break + asserts harm; else SUSPECTED.
+  * typed Invariant IR (`ir` subcommand) as the machine contract discovery->harness->gate.
+  * tiered counterexample-first ladder (`run`): Tier-0 forge -> Tier-1 medusa/echidna
+    -> Tier-2 halmos (eval-gated, FUZZPIPE_SYMBOLIC=1).
+  * real wall-clock timeouts; version-tolerant Medusa parser; one env namespace FUZZPIPE_*.
+  * shipped regression suite (`selftest`).
+
+Subcommands:
+  doctor  init  scaffold  build  gen-handlers  run  triage  verify  verify-harness  ir  coverage
+  status  selftest
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+# --- make sibling modules importable no matter how the script is invoked (symlink/abs path) ---
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import proc            # noqa: E402
+import render          # noqa: E402
+import ir as irmod     # noqa: E402
+import verdict         # noqa: E402
+import medusa_parse    # noqa: E402
+import handlers as handlers_mod  # noqa: E402
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+STATE_DIR_NAME = ".fuzzpipe"
+
+# ------------------------------------------------------------------- ENV (single namespace: read here only)
+# The ONLY environment variables this tool reads. Documented in exactly one place (SKILL.md/README §env)
+# and read in exactly one place (here). `selftest` greps that the two sets agree (no doc/code drift).
+ENV_SYMBOLIC = "FUZZPIPE_SYMBOLIC"            # "1" enables the eval-gated Tier-2 halmos
+ENV_EMIT_FINDINGS = "FUZZPIPE_EMIT_FINDINGS"  # "1" marks CONFIRMED results promotable to output/
+
+
+def symbolic_enabled():
+    return os.environ.get(ENV_SYMBOLIC) == "1"
+
+
+def emit_findings_enabled():
+    return os.environ.get(ENV_EMIT_FINDINGS) == "1"
+
+
+# --------------------------------------------------------------------- SUPPORT MATRIX (single source of truth)
+# The ONLY place the runtime-support facts live. Every other doc points here; `selftest`'s
+# test_support_matrix_single_source asserts no file contradicts the Hardhat v2 AND v3 statement.
+SUPPORT_MATRIX = [
+    ("python3 (stdlib)", "the CLI itself", "no install - zero CLI deps"),
+    ("forge (Foundry)", "scaffold, build, Tier-0, the verdict gate", "REQUIRED"),
+    ("medusa + crytic-compile", "Tier-1 stateful campaign", "optional"),
+    ("echidna", "Tier-1 cross-check", "optional"),
+    ("halmos", "Tier-2 symbolic (eval-gated)", "optional; FUZZPIPE_SYMBOLIC=1"),
+    ("slither", "seeds the fuzzing dictionary", "optional; absence is a warning"),
+    ("node/npx", "Hardhat targets only", "Hardhat v2 AND v3 (crytic-compile >= 0.4)"),
+]
+
+# ------------------------------------------------------------------------------------- console helpers
+
+
+def c(txt, color):
+    codes = {"red": 31, "green": 32, "yellow": 33, "blue": 34, "bold": 1}
+    if not sys.stdout.isatty():
+        return txt
+    return "\033[%dm%s\033[0m" % (codes[color], txt)
+
+
+def info(msg):  print(c("[fuzzpipe] ", "blue") + msg)
+def ok(msg):    print(c("[ok] ", "green") + msg)
+def warn(msg):  print(c("[warn] ", "yellow") + msg)
+def err(msg):   print(c("[error] ", "red") + msg, file=sys.stderr)
+
+
+def _augment_path():
+    """Discover common tool install dirs even in a clean shell. Idempotent."""
+    home = os.path.expanduser("~")
+    extra = [os.path.join(home, ".foundry", "bin"), os.path.join(home, "go", "bin"),
+             os.path.join(home, ".local", "bin"), os.path.join(home, ".cargo", "bin")]
+    parts = os.environ.get("PATH", "").split(os.pathsep)
+    for d in extra:
+        if os.path.isdir(d) and d not in parts:
+            parts.append(d)
+    os.environ["PATH"] = os.pathsep.join(parts)
+
+
+_augment_path()
+
+
+def have(tool):
+    return shutil.which(tool) is not None
+
+
+def run_cmd(cmd, cwd=None, stream=True, timeout=None):
+    """Run a command. Streaming -> (rc, "").  Captured -> (rc, output).  NEVER raises on a
+    missing binary (returns proc.RC_MISSING). A timeout kills the child (proc.RC_TIMEOUT)."""
+    info("$ " + " ".join(str(x) for x in cmd))
+    if stream and timeout is None:
+        return proc.run_stream(cmd, cwd=cwd), ""
+    return proc.run_bounded(cmd, timeout or 3600, cwd=cwd)
+
+
+def state_dir(target):
+    return Path(target).resolve() / STATE_DIR_NAME
+
+
+def load_config(target):
+    """The higher-level intent file (.fuzzpipe/config.json, seeded from the template at init).
+    Returns {} if absent/unreadable — every consumer must fall back to a hard default."""
+    f = state_dir(target) / "config.json"
+    if not f.exists():
+        return {}
+    try:
+        return json.loads(f.read_text())
+    except Exception:
+        return {}
+
+
+# Default Medusa internal worker (goroutine) count. Kept in ONE place so the value the code
+# writes and the value the docs advertise cannot drift (guidance/03 + README point here).
+DEFAULT_MEDUSA_WORKERS = 8
+
+
+def _medusa_workers(target, override=None):
+    if override:
+        return int(override)
+    cfg = load_config(target)
+    return int((cfg.get("fuzzing") or {}).get("workers") or DEFAULT_MEDUSA_WORKERS)
+
+
+def _ladder_budgets(target, tier1_override=None):
+    """Per-tier wall-clock budgets (seconds). Reads config `budgets`, falls back to defaults,
+    and lets an explicit --budget override the tier-1 (fuzzing) budget."""
+    cfg = (load_config(target).get("budgets") or {})
+    b = {0: int(cfg.get("tier0", 60)),
+         1: int(tier1_override or cfg.get("tier1", 600)),
+         2: int(cfg.get("tier2", 900))}
+    return b
+
+
+def load_state(target):
+    f = state_dir(target) / "state.json"
+    return json.loads(f.read_text()) if f.exists() else {}
+
+
+def save_state(target, state):
+    sd = state_dir(target)
+    sd.mkdir(parents=True, exist_ok=True)
+    state["updated"] = datetime.now(timezone.utc).isoformat()
+    (sd / "state.json").write_text(json.dumps(state, indent=2))
+
+
+def set_stage(target, stage, **extra):
+    st = load_state(target)
+    st["stage"] = stage
+    st.setdefault("history", []).append(
+        {"stage": stage, "at": datetime.now(timezone.utc).isoformat(), **extra})
+    st.update(extra)
+    save_state(target, st)
+
+
+# --------------------------------------------------------------------------- project-type detection
+
+
+def _detect_project_type(target):
+    target = Path(target)
+    has_foundry = (target / "foundry.toml").exists()
+    has_hardhat = any((target / ("hardhat.config." + ext)).exists() for ext in ("js", "ts", "cjs"))
+    if has_hardhat and not has_foundry:
+        return "hardhat"
+    if has_hardhat and has_foundry:
+        st = load_state(target)
+        if st.get("project_type"):
+            return st["project_type"]
+        return "foundry"
+    if has_foundry:
+        return "foundry"
+    return None
+
+
+def _project_type(target, override=None):
+    if override:
+        st = load_state(target)
+        st["project_type"] = override
+        save_state(target, st)
+        return override
+    st = load_state(target)
+    if st.get("project_type"):
+        return st["project_type"]
+    pt = _detect_project_type(target)
+    if pt:
+        st["project_type"] = pt
+        save_state(target, st)
+    return pt
+
+
+def _recon_dir(target, pt):
+    if pt == "hardhat":
+        return Path(target) / "contracts" / "recon"
+    return Path(target) / "test" / "recon"
+
+
+def _hardhat_config_path(target):
+    for ext in ("ts", "cjs", "js"):
+        p = Path(target) / ("hardhat.config." + ext)
+        if p.exists():
+            return p
+    return None
+
+
+def _hardhat_major(target):
+    pkg = Path(target) / "node_modules" / "hardhat" / "package.json"
+    if pkg.exists():
+        try:
+            return int(json.loads(pkg.read_text()).get("version", "").split(".")[0])
+        except Exception:
+            return None
+    proj = Path(target) / "package.json"
+    if proj.exists():
+        try:
+            data = json.loads(proj.read_text())
+            import re as _re
+            for sect in ("devDependencies", "dependencies"):
+                spec = (data.get(sect) or {}).get("hardhat")
+                if spec:
+                    m = _re.search(r"(\d+)", spec)
+                    if m:
+                        return int(m.group(1))
+        except Exception:
+            pass
+    return None
+
+
+def _crytic_compile_version():
+    """crytic-compile version string, or None. GUARDED — never raises when it is absent (Q1)."""
+    code, out = proc.run_probe(["crytic-compile", "--version"])
+    if code == 0 and out.strip():
+        return out.strip().split()[-1]
+    return None
+
+
+# ----------------------------------------------------------------------------------- tool registry
+
+TOOLS = {
+    "forge":   ("forge",   "curl -L https://foundry.paradigm.xyz | bash && foundryup"),
+    "medusa":  ("medusa",  "go install github.com/crytic/medusa@latest"),
+    "echidna": ("echidna", "see https://github.com/crytic/echidna/releases (download binary)"),
+    "crytic-compile": ("crytic-compile", "pip install 'crytic-compile>=0.4'   # >=0.4 required for Hardhat 3"),
+    "halmos":  ("halmos",  "pip install halmos   # Tier-2 symbolic (eval-gated: FUZZPIPE_SYMBOLIC=1)"),
+    "slither": ("slither", "pip install slither-analyzer"),
+    "node":    ("node",    "https://nodejs.org"),
+    "npx":     ("npx",     "bundled with Node.js (https://nodejs.org)"),
+}
+
+CORE_FOR = {
+    "scaffold": ["forge"], "build": ["forge"],
+    "run-medusa": ["medusa", "crytic-compile"], "run-echidna": ["echidna", "crytic-compile"],
+    "run-foundry": ["forge"], "run-halmos": ["halmos"], "triage": [],
+    "scaffold-hardhat": ["forge", "npx"], "build-hardhat": ["forge"],
+    "run-medusa-hardhat": ["medusa", "crytic-compile"], "run-echidna-hardhat": ["echidna", "crytic-compile"],
+    "triage-hardhat": ["npx"],
+}
+
+# --------------------------------------------------------------------------------- doctor
+
+
+def cmd_doctor(args):
+    info("Checking fuzzing toolchain (every probe guarded - this never crashes on a missing tool)...")
+    missing = []
+    for name, (binary, install) in TOOLS.items():
+        if have(binary):
+            ok("%-16s found (%s)" % (name, shutil.which(binary)))
+        else:
+            warn("%-16s MISSING" % name)
+            missing.append((name, install))
+    print()
+    print(c("Runtime support matrix (the single source of truth):", "bold"))
+    for rt, need, note in SUPPORT_MATRIX:
+        print("  %-26s %-42s %s" % (rt, need, note))
+    # Hardhat 3 needs crytic-compile >= 0.4 - GUARDED version check (Q1 fix)
+    cc = _crytic_compile_version()
+    if cc:
+        try:
+            ok_hh3 = tuple(int(x) for x in cc.split(".")[:2]) >= (0, 4)
+        except Exception:
+            ok_hh3 = False
+        if ok_hh3:
+            print(c("  Hardhat v2 AND v3 supported (crytic-compile %s >= 0.4)." % cc, "green"))
+        else:
+            print(c("  Hardhat v2 supported. For v3 upgrade crytic-compile (have %s, need >= 0.4): "
+                    "pip install --upgrade 'crytic-compile>=0.4'" % cc, "yellow"))
+    else:
+        print(c("  crytic-compile absent - install it (>= 0.4) for Medusa/Echidna and Hardhat v3.", "yellow"))
+    print()
+    if missing:
+        warn("Missing tools - install commands:")
+        for name, install in missing:
+            print("  %s: %s" % (c(name, "bold"), install))
+        print()
+        info("Skills-only setup is fine for design work. Install tools before Stage 1+.")
+    else:
+        ok("All tools present. Ready for the full pipeline (Foundry + Hardhat v2/v3).")
+    # doctor is a diagnosis, not a gate: exit 0 always (a missing OPTIONAL tool is not an error)
+    return 0
+
+
+# ----------------------------------------------------------------------------------- init
+
+
+def cmd_init(args):
+    target = Path(args.target).resolve()
+    if not target.exists():
+        err("target path does not exist: %s" % target)
+        return 1
+    sd = state_dir(target)
+    sd.mkdir(parents=True, exist_ok=True)
+    for sub in ("runs", "corpus", "findings", "poc", "medusa"):
+        (sd / sub).mkdir(exist_ok=True)
+    tmpl = PROJECT_ROOT / "templates" / "fuzzpipe.config.json"
+    cfg_path = sd / "config.json"
+    if tmpl.exists() and not cfg_path.exists():
+        try:
+            cfg = json.loads(tmpl.read_text())
+            cfg["target"] = str(target)
+            cfg_path.write_text(json.dumps(cfg, indent=2))
+        except Exception:
+            pass
+    inv = sd / "invariants.md"
+    if not inv.exists():
+        inv.write_text(
+            "# Invariants for this run\n\n"
+            "## Seed (auditor, HIGH priority)\n"
+            "<!-- Stage 0: paste auditor-provided invariants here. Leave empty for Auto mode. -->\n\n"
+            "## Discovered + Library (Stage 2 fills this; AWAIT AUDITOR APPROVAL)\n\n"
+            "| ID | Statement | Category | Priority | Source | Constrains | Tolerance |\n"
+            "|----|-----------|----------|----------|--------|------------|-----------|\n")
+    if not (sd / "invariants.json").exists():
+        irmod.dump(sd / "invariants.json", [])
+    pt = _project_type(target, getattr(args, "project_type", None))
+    set_stage(target, "0-init", mode="unset", project_type=pt)
+    ok("Initialized run state at %s" % sd)
+    if pt == "foundry":
+        info("Detected project type: Foundry.")
+    elif pt == "hardhat":
+        hv = _hardhat_major(target)
+        info("Detected project type: Hardhat%s. A Foundry compile layer will be added at scaffold."
+             % ((" v" + str(hv)) if hv else ""))
+        if hv and hv >= 3:
+            cc = _crytic_compile_version()
+            if cc and tuple(int(x) for x in cc.split(".")[:2]) < (0, 4):
+                warn("Hardhat 3 needs crytic-compile >= 0.4 (you have %s). Upgrade: "
+                     "pip install --upgrade 'crytic-compile>=0.4'" % cc)
+    else:
+        warn("Could not detect project type (no foundry.toml or hardhat.config.*). "
+             "Pass --project-type foundry|hardhat.")
+    info("Next: seed invariants in .fuzzpipe/invariants.md (optional), then `scaffold`.")
+    return 0
+
+
+# ------------------------------------------------------------------------------- scaffold
+
+
+def _ensure_chimera_lib(target, offline=False):
+    """Vendor Chimera (+ setup-helpers). Network failures are NON-FATAL (Q5): print the exact
+    manual fallback and continue so an offline user is never hard-blocked. Returns True if the
+    lib is present, False if it is missing (caller decides whether to proceed)."""
+    have_lib = (target / "lib" / "chimera").exists()
+    if not have_lib:
+        if offline:
+            warn("--offline: skipping Chimera vendoring. If lib/chimera is absent, install it "
+                 "manually when you have network:")
+            print("  cd %s && forge install Recon-Fuzz/chimera" % target)
+            return (target / "lib" / "chimera").exists()
+        if have("forge"):
+            code, _ = run_cmd(["forge", "install", "Recon-Fuzz/chimera", "--no-git"], cwd=str(target))
+            if code != 0:
+                code, _ = run_cmd(["forge", "install", "Recon-Fuzz/chimera"], cwd=str(target))
+        else:
+            code, _ = run_cmd(["git", "clone", "--depth", "1",
+                               "https://github.com/Recon-Fuzz/chimera", "lib/chimera"], cwd=str(target))
+        if code != 0 or not (target / "lib" / "chimera").exists():
+            warn("could not vendor Recon-Fuzz/chimera (offline or network error). NON-FATAL - "
+                 "scaffold continues; vendor it manually before `build`:")
+            print("  cd %s && forge install Recon-Fuzz/chimera" % target)
+            print("  (or) git clone --depth 1 https://github.com/Recon-Fuzz/chimera lib/chimera")
+            return False
+    if not (target / "lib" / "setup-helpers").exists() and not offline:
+        if have("forge"):
+            run_cmd(["forge", "install", "Recon-Fuzz/setup-helpers", "--no-git"], cwd=str(target))
+        else:
+            run_cmd(["git", "clone", "--depth", "1",
+                     "https://github.com/Recon-Fuzz/setup-helpers", "lib/setup-helpers"], cwd=str(target))
+    return True
+
+
+def _ensure_remappings(target):
+    remap = target / "remappings.txt"
+    lines = remap.read_text().splitlines() if remap.exists() else []
+    wanted = [("@chimera/", "@chimera/=lib/chimera/src/"),
+              ("@recon/", "@recon/=lib/setup-helpers/src/"),
+              ("forge-std/", "forge-std/=lib/forge-std/src/")]
+    for prefix, line in wanted:
+        if not any(l.startswith(prefix) for l in lines):
+            lines.append(line)
+    remap.write_text("\n".join(lines) + "\n")
+
+
+def _write_recon_stubs(recon, force, include_foundry_repro=True):
+    recon.mkdir(parents=True, exist_ok=True)
+    stubs = {"Setup.sol": _stub_setup(), "TargetFunctions.sol": _stub_targets(),
+             "Properties.sol": _stub_properties(), "BeforeAfter.sol": _stub_beforeafter(),
+             "CryticTester.sol": _stub_crytictester()}
+    if include_foundry_repro:
+        stubs["CryticToFoundry.sol"] = _stub_crytictofoundry()
+    for fname, content in stubs.items():
+        fp = recon / fname
+        if not fp.exists() or force:
+            fp.write_text(content)
+
+
+# ------------------------------------------------ gen-handlers (ABI-driven complete call surface)
+# Root cause of low coverage: the scaffold writes an EMPTY TargetFunctions.sol, so the fuzzer only
+# ever calls the handful of handlers the skill hand-wrote per invariant. This generates a COMPLETE
+# handler surface from the ABI of every in-scope deployed target, decoupling coverage from invariant
+# count. Mechanical only; the rendering lives in the `handlers` module.
+
+
+def _infer_src(target, pt, override):
+    """Best-effort source dir for the surface scan: honor --src, else src/ (Foundry) or contracts/."""
+    if override:
+        return override
+    if (Path(target) / "src").is_dir():
+        return None                       # _src_dirs default handles it
+    if (Path(target) / "contracts").is_dir():
+        return "contracts"
+    return None
+
+
+def _scope_contracts(target):
+    """Contract names declared in-scope via scope.txt (basename stems). Empty set if no scope.txt —
+    the caller then treats every deployed instance as in-scope."""
+    f = Path(target) / "scope.txt"
+    names = set()
+    if f.exists():
+        for line in f.read_text().splitlines():
+            line = line.strip()
+            if line.endswith(".sol"):
+                names.add(Path(line).stem)
+    return names
+
+
+def _discover_instances(target, pt):
+    """Map a deployed contract TYPE -> its Setup variable name, by scanning Setup.sol for typed
+    declarations (`UpsideProtocol internal protocol;`) and constructions (`x = new UpsideProtocol(`).
+    This binds an ABI (keyed by type) to the harness variable the generated handlers must call."""
+    setup = _recon_dir(target, pt) / "Setup.sol"
+    inst = {}
+    if not setup.exists():
+        return inst
+    text = setup.read_text(errors="replace")
+    text = _re_mod.sub(r"/\*.*?\*/", " ", text, flags=_re_mod.S)
+    text = "\n".join(ln[:ln.find("//")] if "//" in ln else ln for ln in text.splitlines())
+    for m in _re_mod.finditer(r"\b([A-Z]\w*)\s+(?:internal|public|private)?\s*(\w+)\s*;", text):
+        inst.setdefault(m.group(1), m.group(2))
+    for m in _re_mod.finditer(r"(\w+)\s*=\s*new\s+([A-Z]\w*)\s*\(", text):
+        inst.setdefault(m.group(2), m.group(1))
+    return inst
+
+
+def _manual_handler_names(target, pt):
+    """handler_* already defined in the skill-authored TargetFunctions.sol — these win, so the
+    generated surface skips them (MANUAL-OVERRIDE) to avoid duplicate-definition compile errors."""
+    tf = _recon_dir(target, pt) / "TargetFunctions.sol"
+    if not tf.exists():
+        return set()
+    return set(_re_mod.findall(r"function\s+(handler_\w+)\s*\(", tf.read_text(errors="replace")))
+
+
+def _ensure_auto_in_chain(target, pt):
+    """Splice TargetFunctionsAuto between the skill's TargetFunctions and Properties, WITHOUT
+    touching any hand-written handler body. Idempotent. C3 linearization forbids listing both
+    Properties and (its child) TargetFunctionsAuto, so we SWAP Properties -> TargetFunctionsAuto in
+    the contract header and add the import. Returns True if it changed the file."""
+    tf = _recon_dir(target, pt) / "TargetFunctions.sol"
+    if not tf.exists():
+        return False
+    text = tf.read_text(errors="replace")
+    if "TargetFunctionsAuto" in text:
+        return False                                  # already spliced
+    new = _re_mod.sub(
+        r"(abstract\s+contract\s+TargetFunctions\s+is\s+[^{]*?)\bProperties\b",
+        r"\1TargetFunctionsAuto", text, count=1)
+    if new == text:                                   # header didn't name Properties — append instead
+        new = _re_mod.sub(r"(abstract\s+contract\s+TargetFunctions\s+is\s+[^{]*?)(\s*\{)",
+                          r"\1, TargetFunctionsAuto\2", text, count=1)
+    if 'import {TargetFunctionsAuto}' not in new:
+        imp = 'import {TargetFunctionsAuto} from "./TargetFunctionsAuto.sol";\n'
+        if 'from "./Properties.sol";' in new:
+            new = new.replace('from "./Properties.sol";', 'from "./Properties.sol";\n' + imp.rstrip(), 1)
+        else:                                          # fall back to right after the pragma line
+            new = _re_mod.sub(r"(pragma solidity[^\n]*\n)", r"\1" + imp, new, count=1)
+    tf.write_text(new)
+    return True
+
+
+def cmd_gen_handlers(args):
+    target = Path(args.target).resolve()
+    pt = _project_type(target, getattr(args, "project_type", None))
+    recon = _recon_dir(target, pt)
+    if not recon.exists():
+        err("no recon harness at %s. Run `fuzzpipe scaffold` first." % recon)
+        return 1
+    instances = _discover_instances(target, pt)
+    scoped = _scope_contracts(target)
+    manual = _manual_handler_names(target, pt)
+    only = getattr(args, "contract", None)
+    src_override = _infer_src(target, pt, getattr(args, "src", None))
+    _, _, privileged = _scan_solidity_surface(target, pt, src_override)
+
+    report = {}          # name/contract -> status
+    handlers = []        # (name, source, status)
+    to_gen = {}          # type -> var
+    for typ, var in instances.items():
+        if only and typ != only:
+            continue
+        if scoped and typ not in scoped:
+            continue                                   # not an in-scope target
+        abi = handlers_mod.load_abi(target, typ)
+        if not abi:
+            report[typ] = "SKIP(no-abi: run `fuzzpipe build` first)"
+            continue
+        to_gen[typ] = (var, abi)
+    for name in sorted(scoped):                        # scoped but never deployed in Setup
+        if name not in instances:
+            report[name] = "SKIP(not-deployed)"
+
+    multi = len(to_gen) > 1
+    for typ in sorted(to_gen):
+        var, abi = to_gen[typ]
+        for fn in handlers_mod.mutating_functions(abi):
+            is_priv = fn["name"] in privileged
+            name, src, status = handlers_mod.render_handler(var, fn, multi=multi, privileged=is_priv)
+            if name in manual:
+                report[name] = "MANUAL-OVERRIDE"
+                continue
+            handlers.append((name, src, status))
+            report[name] = status
+
+    if not to_gen:
+        warn("no in-scope deployed target found (need a typed instance in Setup.sol whose contract "
+             "is listed in scope.txt and has a built ABI). Nothing generated.")
+        _write_gen_report(target, report)
+        return 1
+
+    content = handlers_mod.render_auto_file(handlers)
+    (recon / "TargetFunctionsAuto.sol").write_text(content)
+    spliced = _ensure_auto_in_chain(target, pt)
+    _write_gen_report(target, report)
+
+    gen = sum(1 for _, _, s in handlers if s.startswith("GEN"))
+    stub = sum(1 for _, _, s in handlers if s.startswith("STUB"))
+    ovr = sum(1 for v in report.values() if v == "MANUAL-OVERRIDE")
+    ok("Generated %d handler(s) into %s (%d full, %d struct-stub, %d manual-override)."
+       % (len(handlers), recon / "TargetFunctionsAuto.sol", gen, stub, ovr))
+    if spliced:
+        info("Spliced TargetFunctionsAuto into the harness inheritance chain.")
+    print(c("\ngen-handlers report (%s)" % target.name, "bold"))
+    for name in sorted(report):
+        status = report[name]
+        color = "green" if status.startswith("GEN") else ("yellow" if "MANUAL" in status else "red")
+        print("    [%s] %s" % (c(status, color), name))
+    if stub:
+        warn("%d struct/tuple handler(s) are STUBS — fill their `_build_*` hook in TargetFunctions.sol "
+             "or they contribute no coverage." % stub)
+    info("Next: `fuzzpipe build` (recompile), then `verify-harness` and `run`.")
+    set_stage(target, "3-gen-handlers", generated=len(handlers), stubs=stub, overrides=ovr)
+    return 0
+
+
+def _write_gen_report(target, report):
+    sd = state_dir(target)
+    sd.mkdir(parents=True, exist_ok=True)
+    (sd / "gen-handlers.json").write_text(json.dumps(report, indent=2, sort_keys=True))
+
+
+def cmd_scaffold(args):
+    target = Path(args.target).resolve()
+    pt = _project_type(target, getattr(args, "project_type", None))
+    offline = getattr(args, "offline", False)
+    if pt == "hardhat":
+        return _scaffold_hardhat(target, args, offline)
+    if pt is None:
+        warn("No project type detected; assuming Foundry. Pass --project-type hardhat for Hardhat.")
+    return _scaffold_foundry(target, args, offline)
+
+
+def _scaffold_foundry(target, args, offline):
+    missing = [t for t in CORE_FOR["scaffold"] if not have(TOOLS[t][0])]
+    if missing and not offline:
+        err("cannot scaffold - missing tools: " + ", ".join(missing))
+        for m in missing:
+            print("  install %s: %s" % (m, TOOLS[m][1]))
+        return 1
+    recon = _recon_dir(target, "foundry")
+    if recon.exists() and not args.force:
+        warn("recon harness already exists at %s (use --force to regenerate)" % recon)
+        set_stage(target, "1-scaffold", harness=str(recon), project_type="foundry")
+        return 0
+    info("Scaffolding Chimera harness (Foundry)...")
+    lib_ok = _ensure_chimera_lib(target, offline)
+    _ensure_remappings(target)
+    _write_recon_stubs(recon, args.force, include_foundry_repro=True)
+    set_stage(target, "1-scaffold", harness=str(recon), project_type="foundry", chimera=lib_ok)
+    ok("Chimera harness skeleton created at %s" % recon)
+    if not lib_ok:
+        warn("lib/chimera not vendored yet - `build` will fail until you install it (see above). "
+             "The skeleton is written so you can vendor + build when ready.")
+    info("Stubs: Setup, TargetFunctions, Properties, BeforeAfter, CryticTester, CryticToFoundry.")
+    info("Next: `verify-harness` (preflight), then Stage 2 (invariant discovery).")
+    return 0
+
+
+def _scaffold_hardhat(target, args, offline):
+    missing = [t for t in CORE_FOR["scaffold-hardhat"] if not have(TOOLS[t][0])]
+    if missing and not offline:
+        err("cannot scaffold (Hardhat) - missing tools: " + ", ".join(missing))
+        for m in missing:
+            print("  install %s: %s" % (m, TOOLS[m][1]))
+        return 1
+    recon = _recon_dir(target, "hardhat")
+    if recon.exists() and not args.force:
+        warn("recon harness already exists at %s (use --force to regenerate)" % recon)
+        set_stage(target, "1-scaffold", harness=str(recon), project_type="hardhat")
+        return 0
+    info("Scaffolding Chimera harness (Hardhat: adding a Foundry compile layer)...")
+    lib_ok = _ensure_chimera_lib(target, offline)
+    _ensure_remappings(target)
+    ftoml = target / "foundry.toml"
+    if not ftoml.exists() or args.force:
+        ftoml.write_text('[profile.default]\nsrc = "contracts"\nout = "out"\n'
+                         'libs = ["lib"]\ntest = "contracts"\n')
+        info("wrote foundry.toml (src=contracts) - required by hardhat-foundry")
+    if not offline and _ensure_hardhat_foundry_plugin(target) != 0:
+        warn("hardhat-foundry plugin not fully wired - see messages above. Scaffold continues.")
+    _write_recon_stubs(recon, args.force, include_foundry_repro=False)
+    repro_dir = target / "foundry-repro"
+    repro_dir.mkdir(parents=True, exist_ok=True)
+    repro_file = repro_dir / "CryticToFoundry.sol"
+    if not repro_file.exists() or args.force:
+        repro_file.write_text(_stub_crytictofoundry())
+    set_stage(target, "1-scaffold", harness=str(recon), project_type="hardhat", chimera=lib_ok)
+    ok("Chimera harness skeleton created at %s" % recon)
+    info("Next: `verify-harness` (preflight), then Stage 2 (invariant discovery).")
+    return 0
+
+
+def _ensure_hardhat_foundry_plugin(target):
+    if (target / "pnpm-lock.yaml").exists():
+        install = ["pnpm", "add", "-D", "@nomicfoundation/hardhat-foundry@^1.1.0"]
+    elif (target / "yarn.lock").exists():
+        install = ["yarn", "add", "-D", "@nomicfoundation/hardhat-foundry@^1.1.0"]
+    else:
+        install = ["npm", "install", "--save-dev", "@nomicfoundation/hardhat-foundry@^1.1.0"]
+    if not (target / "node_modules" / "@nomicfoundation" / "hardhat-foundry").exists():
+        code, _ = run_cmd(install, cwd=str(target))
+        if code != 0:
+            warn("could not install @nomicfoundation/hardhat-foundry. Install manually:")
+            print("  " + " ".join(install))
+            return 1
+    cfg = _hardhat_config_path(target)
+    if not cfg:
+        warn("no hardhat.config.* found to wire the plugin into.")
+        return 1
+    text = cfg.read_text()
+    if "hardhat-foundry" in text:
+        return 0
+    bak = cfg.with_suffix(cfg.suffix + ".bak")
+    if not bak.exists():
+        bak.write_text(text)
+    line = ('import "@nomicfoundation/hardhat-foundry";\n'
+            if cfg.suffix == ".ts" or "export default" in text or "import " in text
+            else 'require("@nomicfoundation/hardhat-foundry");\n')
+    cfg.write_text(line + text)
+    info("loaded hardhat-foundry in %s (backup: %s)" % (cfg.name, bak.name))
+    return 0
+
+
+# --------------------------------------------------- chimera scaffold stubs
+
+
+def _stub_setup():
+    return ('// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\n'
+            'import {BaseSetup} from "@chimera/BaseSetup.sol";\n\n'
+            '// Stage 3 (skill) fills this: deploy the protocol, create actors, fund balances.\n'
+            'abstract contract Setup is BaseSetup {\n'
+            '    function setup() internal virtual override {\n'
+            '        // TODO(skill): deploy target contracts + mock assets, register actors.\n'
+            '    }\n}\n')
+
+
+def _stub_targets():
+    return ('// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\n'
+            'import {BaseTargetFunctions} from "@chimera/BaseTargetFunctions.sol";\n'
+            'import {Properties} from "./Properties.sol";\n\n'
+            '// Stage 3: run `fuzzpipe gen-handlers` to AUTO-GENERATE the complete ABI-driven call\n'
+            '// surface (TargetFunctionsAuto.sol). The skill only tunes clamps/Setup and adds\n'
+            '// invariant-asserting handlers here; a handler_* named the same as a generated one\n'
+            '// wins (MANUAL-OVERRIDE) so there is no duplicate-definition conflict.\n'
+            'abstract contract TargetFunctions is BaseTargetFunctions, Properties {\n'
+            '    // function handler_deposit(uint256 assets) public { ... }\n}\n')
+
+
+def _stub_properties():
+    return ('// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\n'
+            'import {BeforeAfter} from "./BeforeAfter.sol";\n'
+            'import {Asserts} from "@chimera/Asserts.sol";\n\n'
+            '// Stage 3 (skill) fills this: one boolean property_* per approved invariant (mapped to its IR id).\n'
+            'abstract contract Properties is BeforeAfter, Asserts {\n'
+            '    // function property_INV_SOLVENCY() public returns (bool) { ... }\n}\n')
+
+
+def _stub_beforeafter():
+    return ('// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\n'
+            'import {Setup} from "./Setup.sol";\n\n'
+            '// Stage 3 (skill) fills this: ghost-variable snapshots before/after each call.\n'
+            'abstract contract BeforeAfter is Setup {\n'
+            '    struct Vars { uint256 placeholder; }\n'
+            '    Vars internal _before;\n    Vars internal _after;\n\n'
+            '    modifier updateGhosts() {\n        __snapshot(_before);\n        _;\n'
+            '        __snapshot(_after);\n    }\n\n'
+            '    function __snapshot(Vars storage v) internal {\n        v.placeholder = 0;\n    }\n}\n')
+
+
+def _stub_crytictester():
+    return ('// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\n'
+            'import {TargetFunctions} from "./TargetFunctions.sol";\n'
+            'import {CryticAsserts} from "@chimera/CryticAsserts.sol";\n\n'
+            '// Echidna/Medusa entrypoint. Usually left as-is.\n'
+            'contract CryticTester is TargetFunctions, CryticAsserts {\n'
+            '    constructor() payable {\n        setup();\n    }\n}\n')
+
+
+def _stub_crytictofoundry():
+    return ('// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\n'
+            'import {Test} from "forge-std/Test.sol";\n'
+            'import {TargetFunctions} from "./TargetFunctions.sol";\n'
+            'import {FoundryAsserts} from "@chimera/FoundryAsserts.sol";\n\n'
+            '// Foundry entrypoint + home for reproducer tests (Stage 5 verdict gate writes here).\n'
+            'contract CryticToFoundry is Test, TargetFunctions, FoundryAsserts {\n'
+            '    function setUp() public {\n        setup();\n    }\n}\n')
+
+
+# ----------------------------------------------------- engine config generation
+
+
+def _tester_rel_path(target):
+    for cand in ("test/recon/CryticTester.sol", "contracts/recon/CryticTester.sol",
+                 "test/CryticTester.sol", "src/CryticTester.sol"):
+        if (Path(target) / cand).exists():
+            return cand
+    for p in Path(target).rglob("CryticTester.sol"):
+        if "lib/" not in str(p):
+            return str(p.relative_to(target))
+    return "test/recon/CryticTester.sol"
+
+
+def _disable_slither_for_hh3(target, pt):
+    return pt == "hardhat" and (_hardhat_major(target) or 2) >= 3
+
+
+def _medusa_config_dict(target, depth, limit, pt, corpus, targets=None, workers=None):
+    d = {
+        "fuzzing": {
+            "workers": _medusa_workers(target, workers),
+            "testLimit": int(limit), "callSequenceLength": int(depth),
+            "corpusDirectory": corpus,
+            "deploymentOrder": targets or ["CryticTester"],
+            "targetContracts": targets or ["CryticTester"],
+            "testChainConfig": {"codeSizeCheckDisabled": True},
+        },
+        "compilation": {"platform": "crytic-compile",
+                        "platformConfig": {"target": _tester_rel_path(target), "solcVersion": ""}},
+        "testing": {"stopOnFailedTest": True, "testAllContracts": False,
+                    "assertionTesting": {"enabled": True},
+                    "propertyTesting": {"enabled": True, "testPrefix": "property_"},
+                    "optimizationTesting": {"enabled": False}},
+    }
+    if _disable_slither_for_hh3(target, pt):
+        d["slither"] = {"useSlither": False}
+    return d
+
+
+def _write_medusa_config(target, depth, limit, force=False, pt=None, workers=None):
+    cfg = Path(target) / "medusa.json"
+    if cfg.exists() and not force:
+        return cfg
+    cfg.write_text(json.dumps(
+        _medusa_config_dict(target, depth, limit, pt, ".fuzzpipe/corpus/medusa", workers=workers),
+        indent=2))
+    info("wrote medusa.json (compile target: %s)" % _tester_rel_path(target))
+    return cfg
+
+
+def _stage_medusa_config_for_invariant(target, inv_id, depth, limit, pt=None, workers=None):
+    """Per-shard staged medusa.json with its OWN corpus dir, keyed by invariant id, written under
+    .fuzzpipe/medusa/<INV>.json. Two properties this buys:
+      * Isolation — one shard's corpus/`stopOnFailedTest` never disturbs another's, so a break in
+        one shard can't cut short the others, and `triage` can attribute a failing sequence to the
+        shard (invariant) it came from via its own test_results dir.
+      * Parallel breadth — N shards run concurrently (see `cmd_run`), so within one wall-clock
+        budget the fleet explores ~N× the sequences a single process would, diversified by
+        independent corpora. The first shard to surface a counterexample short-circuits to triage.
+    """
+    out = state_dir(target) / "medusa" / (inv_id + ".json")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # medusa resolves a --config file's RELATIVE paths against the CONFIG's directory, not the
+    # project root, so a staged config under .fuzzpipe/medusa/ must use ABSOLUTE paths for both the
+    # compile target and the corpus dir (else crytic-compile can't find the harness). The corpus dir
+    # stays under state_dir so `triage` (which reads state_dir/corpus/medusa/<INV>/test_results)
+    # still finds this shard's failing sequences.
+    corpus = str(state_dir(target) / "corpus" / "medusa" / inv_id)
+    cfg = _medusa_config_dict(target, depth, limit, pt, corpus, workers=workers)
+    cfg["compilation"]["platformConfig"]["target"] = str(Path(target) / _tester_rel_path(target))
+    out.write_text(json.dumps(cfg, indent=2))
+    return out
+
+
+def _write_echidna_config(target, depth, limit, force=False, pt=None):
+    cfg = Path(target) / "echidna.yaml"
+    if cfg.exists() and not force:
+        return cfg
+    cfg.write_text("testMode: assertion\ntestLimit: %d\nseqLen: %d\n"
+                   "corpusDir: .fuzzpipe/corpus/echidna\ncoverage: true\n" % (int(limit), int(depth)))
+    info("wrote echidna.yaml")
+    return cfg
+
+
+# ---------------------------------------------------------------------------------- build
+
+
+def _compile_harness(target, pt, timeout=600):
+    if pt == "hardhat" and have("npx"):
+        run_cmd(["npx", "hardhat", "compile"], cwd=str(target), stream=False, timeout=timeout)
+    if have("forge"):
+        code, _ = run_cmd(["forge", "build"], cwd=str(target), stream=False, timeout=timeout)
+        return code
+    warn("forge not installed - the engines need the Foundry compile layer. Install: " + TOOLS["forge"][1])
+    return proc.RC_MISSING
+
+
+def cmd_build(args):
+    target = Path(args.target).resolve()
+    pt = _project_type(target, getattr(args, "project_type", None))
+    code = _compile_harness(target, pt)
+    if code == 0:
+        ok("Harness compiled.")
+        set_stage(target, "3-build", build="ok", project_type=pt)
+    else:
+        err("compile failed - fix harness before running a campaign.")
+        set_stage(target, "3-build", build="failed", project_type=pt)
+    return code
+
+
+# ------------------------------------------------------------------------ verify-harness (preflight)
+
+
+def cmd_verify_harness(args):
+    """Assert the engine can actually SEE the harness before a campaign is spent (avoids the
+    'harness written where the engine never looks' class). Foundry: CryticTester compiles and
+    forge lists the reproducer contract. Medusa/crytic: the tester path resolves."""
+    target = Path(args.target).resolve()
+    pt = _project_type(target, getattr(args, "project_type", None))
+    tester = Path(target) / _tester_rel_path(target)
+    problems = []
+    if not tester.exists():
+        problems.append("CryticTester.sol not found at the expected path (%s)" % _tester_rel_path(target))
+    else:
+        ok("harness entrypoint present: %s" % tester.relative_to(target))
+    if have("forge"):
+        code, out = run_cmd(["forge", "build"], cwd=str(target), stream=False, timeout=600)
+        if code != 0:
+            problems.append("forge build failed - the engine would not compile this harness")
+        else:
+            ok("forge build succeeds - Foundry discovers the harness")
+    else:
+        warn("forge absent - cannot run the compile preflight (install forge).")
+    if problems:
+        for p in problems:
+            err(p)
+        warn("Harness is NOT campaign-ready. Fix the above before `run` (a silently-undiscovered "
+             "harness would report every invariant UNTESTED while looking like it ran).")
+        set_stage(target, "3-verify-harness", harness_ready=False)
+        return 1
+    ok("Harness discovery preflight passed.")
+    set_stage(target, "3-verify-harness", harness_ready=True)
+    return 0
+
+
+# ------------------------------------------------------------------------------------ run (ladder)
+
+
+def _engine_missing(engine, pt):
+    """Tools that must be present for `engine` (honoring the Hardhat variant). Empty == ready."""
+    key = ("run-%s-hardhat" % engine) if (pt == "hardhat" and ("run-%s-hardhat" % engine) in CORE_FOR) else ("run-%s" % engine)
+    return [t for t in CORE_FOR.get(key, []) if not have(TOOLS[t][0])]
+
+
+def _classify_rc(engine, rc, budget_s):
+    """Map a run_bounded rc to a ladder status.
+
+    A fuzzer that runs its whole wall-clock budget without self-terminating found NO counterexample
+    (medusa/echidna exit fast and non-zero on a real break via stopOnFailedTest), so a TIMEOUT is
+    'no-CE-in-budget' (clean), NOT a break — conflating the two produces false candidate breaks."""
+    if rc == proc.RC_TIMEOUT:
+        info("%s ran its full %ss budget with no counterexample (report as 'held under budget', not 'safe')." % (engine, budget_s))
+        return "clean"
+    if rc == proc.RC_MISSING:
+        return "untested"
+    return "clean" if rc == 0 else "break_or_error"
+
+
+def _run_engine(target, engine, pt, depth, limit, budget_s, regen=False, prop=None, workers=None):
+    """Run one engine under a REAL wall-clock budget. Returns (status, rc). status in
+    {clean, break_or_error, untested}. Never raises; a missing engine -> untested."""
+    missing = _engine_missing(engine, pt)
+    if missing:
+        warn("Tier engine `%s` unavailable (missing: %s) -> UNTESTED for this tier." % (engine, ", ".join(missing)))
+        return "untested", proc.RC_MISSING
+    if engine == "foundry":
+        cmd = ["forge", "test", "--match-contract", "CryticToFoundry"]
+        if prop:
+            cmd += ["--match-test", prop]
+    elif engine == "medusa":
+        _write_medusa_config(target, depth, limit, force=regen, pt=pt, workers=workers)
+        cmd = ["medusa", "fuzz"]
+    elif engine == "echidna":
+        _write_echidna_config(target, depth, limit, force=regen, pt=pt)
+        cmd = ["echidna", _tester_rel_path(target), "--contract", "CryticTester", "--config", "echidna.yaml"]
+    elif engine == "halmos":
+        cmd = ["halmos"]
+        if prop:
+            cmd += ["--function", prop]
+    else:
+        return "untested", 1
+    info("Running %s (depth=%s limit=%s budget=%ss) ..." % (engine, depth, limit, budget_s))
+    rc, out = proc.run_bounded(cmd, budget_s, cwd=str(target))
+    (state_dir(target) / "runs" / engine).mkdir(parents=True, exist_ok=True)
+    (state_dir(target) / "runs" / engine / "last.log").write_text(out or "")
+    return _classify_rc(engine, rc, budget_s), rc
+
+
+def _approved_or_candidate_ids(target):
+    """Invariant ids eligible to shard a fuzzing campaign: approved first (post-checkpoint), else
+    candidates. Empty if no IR — the caller then runs a single un-sharded campaign."""
+    invs = irmod.load(state_dir(target) / "invariants.json")
+    approved = [i.id for i in invs if i.status == "approved"]
+    if approved:
+        return approved
+    return [i.id for i in invs if i.status == "candidate"]
+
+
+def _shard_has_breaks(target, shard):
+    """True iff a medusa shard actually wrote failing sequences. `shard` is an invariant id, or
+    None for the flat (single-campaign) corpus."""
+    base = state_dir(target) / "corpus" / "medusa"
+    tr = (base / "test_results") if shard is None else (base / shard / "test_results")
+    return tr.is_dir() and any(tr.glob("*.json"))
+
+
+def _run_tier1(target, pt, depth, limit, budget_s, regen, workers, jobs, parallel):
+    """Tier-1 (medusa + echidna) with concurrency. Returns (results_dict, broke_bool).
+
+    Two axes of parallelism, both via one bounded pool (proc.run_many_bounded):
+      * medusa + echidna run CONCURRENTLY (they share the harness but write to separate
+        corpus/runs dirs, so there is no contention).
+      * medusa itself fans out into per-invariant shards when the IR has >= 2 eligible
+        invariants and parallelism is enabled — each shard its own staged config + corpus dir.
+    Each child keeps its OWN wall-clock budget; the first medusa shard to break short-circuits
+    the ladder (the others are still allowed to finish their in-flight budget).
+    """
+    specs = []   # (engine, shard_id_or_None, cmd)
+    # ---- medusa jobs ----
+    if _engine_missing("medusa", pt):
+        warn("Tier engine `medusa` unavailable (missing: %s) -> UNTESTED for this tier."
+             % ", ".join(_engine_missing("medusa", pt)))
+        results_medusa_untested = True
+    else:
+        results_medusa_untested = False
+        ids = _approved_or_candidate_ids(target) if parallel else []
+        if parallel and len(ids) >= 2:
+            info("Per-invariant parallel fan-out: %d medusa shards (own corpus each)." % len(ids))
+            for inv_id in ids:
+                cfg = _stage_medusa_config_for_invariant(target, inv_id, depth, limit, pt=pt, workers=workers)
+                specs.append(("medusa", inv_id, ["medusa", "fuzz", "--config", str(cfg)]))
+        else:
+            _write_medusa_config(target, depth, limit, force=regen, pt=pt, workers=workers)
+            specs.append(("medusa", None, ["medusa", "fuzz"]))
+    # ---- echidna job (crosscheck) ----
+    if _engine_missing("echidna", pt):
+        warn("Tier engine `echidna` unavailable (missing: %s) -> UNTESTED for this tier."
+             % ", ".join(_engine_missing("echidna", pt)))
+        results_echidna_untested = True
+    else:
+        results_echidna_untested = False
+        _write_echidna_config(target, depth, limit, force=regen, pt=pt)
+        specs.append(("echidna", None,
+                      ["echidna", _tester_rel_path(target), "--contract", "CryticTester",
+                       "--config", "echidna.yaml"]))
+
+    results = {}
+    if results_medusa_untested:
+        results["medusa(t1)"] = "untested"
+    if results_echidna_untested:
+        results["echidna(t1)"] = "untested"
+    if not specs:
+        return results, False
+
+    pool = jobs or proc.default_jobs(len(specs))
+    info("Tier-1: dispatching %d campaign(s) concurrently (pool=%d, budget=%ss each) ..."
+         % (len(specs), min(pool, len(specs)), budget_s))
+    jobspecs = [{"key": (eng, shard), "cmd": cmd, "timeout_s": budget_s, "cwd": str(target)}
+                for (eng, shard, cmd) in specs]
+    outcomes = proc.run_many_bounded(jobspecs, max_workers=pool)
+
+    broke = False
+    for (eng, shard), rc, out in outcomes:
+        sub = eng if shard is None else "%s/%s" % (eng, shard)
+        rundir = state_dir(target) / "runs" / eng / (shard or "")
+        rundir.mkdir(parents=True, exist_ok=True)
+        (rundir / "last.log").write_text(out or "")
+        status = _classify_rc(eng, rc, budget_s)
+        if eng == "medusa" and status == "break_or_error" and not _shard_has_breaks(target, shard):
+            # non-zero exit but NO failing sequence written -> an engine/compile error, not a
+            # counterexample. Never let that masquerade as a break (see the shard's last.log).
+            warn("medusa shard %s exited non-zero but wrote no failing sequence -> ERROR, not a break "
+                 "(check runs/medusa/%s/last.log)." % (sub, shard or ""))
+            status = "untested"
+        label = "%s(t1)" % eng if shard is None else "%s:%s(t1)" % (eng, shard)
+        results[label] = status
+        if status == "break_or_error":
+            broke = True
+            info("shard %s surfaced a candidate break (failing sequence written)." % sub)
+    return results, broke
+
+
+def cmd_run(args):
+    target = Path(args.target).resolve()
+    pt = _project_type(target, getattr(args, "project_type", None))
+    _compile_harness(target, pt)
+
+    workers = getattr(args, "workers", None)
+    jobs = getattr(args, "jobs", None)
+    parallel = not getattr(args, "no_parallel", False)
+
+    # backward-compatible single-engine mode
+    if args.engine:
+        if pt == "hardhat" and args.engine == "foundry":
+            err("the `foundry` engine needs Foundry test wiring; on Hardhat use medusa/echidna.")
+            return 1
+        status, rc = _run_engine(target, args.engine, pt, args.depth, args.limit,
+                                 args.budget, regen=args.regen_config, prop=args.property,
+                                 workers=workers)
+        set_stage(target, "4-run", engine=args.engine, result=status)
+        if status == "clean":
+            ok("%s finished with no property break (record coverage - NOT proof of safety)." % args.engine)
+        elif status == "untested":
+            warn("%s did not run (engine unavailable)." % args.engine)
+        else:
+            warn("%s reported a break or error. Run `fuzzpipe triage` next." % args.engine)
+        return 0 if status != "break_or_error" else rc
+
+    # tiered ladder (counterexample-first). Escalate only on 'no counterexample in budget'.
+    budgets = _ladder_budgets(target, args.budget)
+    tiers = [(0, ["foundry"]), (1, ["medusa", "echidna"]), (2, ["halmos"])]
+    max_tier = args.max_tier
+    results = {}
+    for tier, engines in tiers:
+        if tier > max_tier:
+            break
+        if tier == 2 and not symbolic_enabled():
+            info("Tier-2 (halmos) skipped: eval-gated (set %s=1 for critical bounded SAFETY/CORRECTNESS)." % ENV_SYMBOLIC)
+            continue
+        if tier == 1:
+            # Tier-1 runs medusa (optionally per-invariant sharded) + echidna CONCURRENTLY.
+            tier_results, broke = _run_tier1(target, pt, args.depth, args.limit, budgets[1],
+                                             args.regen_config, workers, jobs, parallel)
+            results.update(tier_results)
+        else:
+            broke = False
+            for engine in engines:
+                status, rc = _run_engine(target, engine, pt, args.depth, args.limit, budgets[tier],
+                                         regen=args.regen_config, workers=workers)
+                results["%s(t%d)" % (engine, tier)] = status
+                if status == "break_or_error":
+                    broke = True
+        if broke:
+            warn("Tier-%d surfaced a candidate break -> stop escalating; run `fuzzpipe triage` (the verdict gate)." % tier)
+            break
+    set_stage(target, "4-run", ladder=results)
+    print(c("\nLadder result:", "bold"))
+    for k, v in results.items():
+        print("  %-18s %s" % (k, v))
+    if not any(v == "break_or_error" for v in results.values()):
+        # HARD coverage gate: a 'held under budget' verdict is only trustworthy if the campaign
+        # actually reached the code. Block the NO-CE verdict when in-scope coverage is missing an
+        # unwaived entry point (or is below the configured floor). This closes the Stage-4 -> Stage-3
+        # loop mechanically instead of leaving it to advisory prose.
+        waivers = _load_waivers(target, None)
+        min_pct = _min_pct_config(target)
+        pass_eng = None
+        for eng in ("medusa", "echidna"):
+            available, passed, reasons = _coverage_gate(target, eng, min_pct, waivers)
+            if not available:
+                continue
+            if not passed:
+                warn("COVERAGE GATE FAILED (%s) — this run CANNOT be reported as 'held under budget':" % eng)
+                for r in reasons:
+                    print("    - " + r)
+                warn("Complete the call surface (`fuzzpipe gen-handlers`), loosen clamps, or record a "
+                     "justified waiver in .fuzzpipe/coverage-waivers.json — then re-run.")
+                set_stage(target, "4-run", ladder=results, coverage_gate="fail")
+                return 2
+            pass_eng = eng
+            break
+        if pass_eng:
+            scope, _ = _coverage_scan(target, pass_eng)
+            ok("No counterexample within budget; coverage gate PASSED at %d%% in-scope lines "
+               "(report as 'held under budget', NOT 'safe')." % (_overall_pct(scope) if scope else 0))
+        else:
+            ok("No counterexample within budget. Report as 'held under budget at C% coverage' - NOT "
+               "'safe'. (No coverage lcov yet — run medusa/echidna with coverage to enforce the gate.)")
+    return 0
+
+
+# --------------------------------------------------------------------------------- triage (gate)
+
+
+def _medusa_results_dirs(target):
+    """Every place a Medusa run may have written failing sequences: the flat single-run dir AND
+    each per-invariant shard's own dir (.fuzzpipe/corpus/medusa/<INV>/test_results). Fixes the
+    v2.1 bug where a per-invariant (sharded) run wrote under <INV>/test_results but triage only
+    ever looked at the flat corpus/medusa/test_results and silently found nothing."""
+    base = state_dir(target) / "corpus" / "medusa"
+    dirs = []
+    flat = base / "test_results"
+    if flat.is_dir():
+        dirs.append(flat)
+    if base.is_dir():
+        for shard in sorted(base.iterdir()):
+            if shard.is_dir() and shard.name != "test_results":
+                tr = shard / "test_results"
+                if tr.is_dir():
+                    dirs.append(tr)
+    return dirs
+
+
+def _collect_medusa_sequences(target):
+    """Merge failing sequences across the flat dir and every shard dir. Shard sequences are
+    tagged with the invariant id so a finding can be attributed to the shard it came from."""
+    sequences, warnings = [], []
+    for d in _medusa_results_dirs(target):
+        seqs, warns = medusa_parse.failing_sequences(d)
+        # d.parent.name is the shard id (invariant) for shard dirs, "medusa" for the flat dir
+        shard = d.parent.name if d.parent.name != "medusa" else None
+        for fname, seq in seqs:
+            tag = ("%s::%s" % (shard, fname)) if shard else fname
+            sequences.append((tag, seq))
+        warnings += warns
+    return sequences, warnings
+
+
+def cmd_triage(args):
+    target = Path(args.target).resolve()
+    pt = _project_type(target, getattr(args, "project_type", None))
+    sequences, warnings = _collect_medusa_sequences(target)
+    for w in warnings:                          # Q6: surface drift, never silently drop
+        warn(w)
+    if not sequences:
+        base = state_dir(target) / "corpus" / "medusa"
+        warn("no Medusa failing-sequence artifacts under %s (checked the flat dir and every shard)." % base)
+        print("  Run `fuzzpipe run --engine medusa` first; triage reads its broken sequences.")
+        set_stage(target, "5-triage", triage="no_artifacts")
+        return 1
+
+    if pt == "hardhat":
+        import_line = 'import {CryticToFoundry} from "./CryticToFoundry.sol";'
+        repro = verdict.render_reproducer_contract(sequences, import_line)
+        out = target / "foundry-repro" / "MedusaReproducers.t.sol"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(repro)
+        ok("Wrote %d reproducer(s) to %s (byte-exact Foundry replay for a Hardhat target)." % (len(sequences), out))
+        info("Add the HARM assertion, then run the verdict gate with `forge test` from the foundry-repro context.")
+        set_stage(target, "5-triage", triage="hardhat_repro", reproducers=len(sequences))
+        return 0
+
+    # Foundry path: type-aware reproducer (Q2/Q3 fix - bool/array/tuple no longer crash)
+    info("Lowering broken sequences into a Foundry reproducer (type-aware rendering)...")
+    import_line = 'import {CryticToFoundry} from "./recon/CryticToFoundry.sol";'
+    repro = verdict.render_reproducer_contract(sequences, import_line)
+    out = target / "test" / "MedusaReproducers.t.sol"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(repro)
+    ok("Wrote %d reproducer test(s) to %s" % (len(sequences), out))
+
+    # verdict gate (best-effort re-execution). CONFIRMED needs a hand-added HARM assertion, so a
+    # freshly-generated reproducer is expected to be SUSPECTED until the skill asserts the harm.
+    if have("forge"):
+        info("Re-executing reproducers (verdict gate)...")
+        rc, gout = verdict.forge_build(target)
+        if rc != 0:
+            warn("reproducer did not compile -> SUSPECTED (fix the harness/rendering, or the sequence is unrenderable).")
+            set_stage(target, "5-triage", triage="suspected_no_compile", reproducers=len(sequences))
+            return 0
+        rc, gout = verdict.forge_test(target, "test_repro", 300)
+        broke = "[FAIL" in (gout or "")
+        if broke:
+            ok("Reproducer triggered a break. Now add the HARM assertion, then `fuzzpipe verify` "
+               "to promote it to CONFIRMED (a break without a harm assertion stays SUSPECTED).")
+        else:
+            warn("Reproducers ran without a break - re-check the sequence/harness (SUSPECTED).")
+    else:
+        warn("forge absent - wrote the reproducer but cannot re-execute it. Verdict: SUSPECTED until re-run.")
+    set_stage(target, "5-triage", triage="native_ok", reproducers=len(sequences))
+    info("Classify each break: real bug / bad invariant (Stage 2) / bad harness (Stage 3). "
+         "See guidance/04 + guidance/05.")
+    return 0
+
+
+# --------------------------------------------------------------------------------- verify (one CE)
+
+
+def cmd_verify(args):
+    """Run the verdict gate on a single reproducer test already present in the target's Foundry
+    project: compile -> re-execute the SPECIFIC break -> require a harm assertion -> CONFIRMED/SUSPECTED."""
+    target = Path(args.target).resolve()
+    poc_path = Path(args.poc) if args.poc else None
+    if poc_path and not poc_path.is_absolute():
+        poc_path = target / poc_path
+    src = poc_path.read_text() if (poc_path and poc_path.exists()) else ""
+    marker = args.marker or (args.ce or "")
+    test_name = args.test or "test_repro"
+    if not have("forge"):
+        err("forge is required for the verdict gate (it re-executes the PoC). Install: " + TOOLS["forge"][1])
+        return 2
+    v, reason, out = verdict.lower_and_verify(target, src, test_name, marker)
+    (state_dir(target) / "poc").mkdir(parents=True, exist_ok=True)
+    (state_dir(target) / "poc" / "last_verdict.log").write_text((out or "")[-8000:])
+    if v == "CONFIRMED":
+        ok("VERDICT: CONFIRMED - %s" % reason)
+        set_stage(target, "5-verify", verdict="CONFIRMED", ce=args.ce)
+        return 0
+    warn("VERDICT: SUSPECTED - %s (never reported as a bug without a re-executing, harm-asserting PoC)." % reason)
+    set_stage(target, "5-verify", verdict="SUSPECTED", ce=args.ce, reason=reason)
+    return 1
+
+
+# --------------------------------------------------------------------------- materiality sweep
+
+def _parse_amount(s):
+    """Parse an amount as an exact integer, accepting integer-mantissa scientific form ('1e24')."""
+    s = str(s).strip().replace("_", "").lower()
+    if "e" in s:
+        m, _, e = s.partition("e")
+        return int(m or "1") * (10 ** int(e))
+    return int(s)
+
+
+def _log_grid(lo, hi):
+    """1-2-5 log-spaced magnitudes in [lo, hi], inclusive of both ends. Deterministic."""
+    lo, hi = max(1, int(lo)), int(hi)
+    hi = max(lo, hi)
+    grid, dec = [], 1
+    while dec <= hi:
+        for mant in (1, 2, 5):
+            v = mant * dec
+            if lo <= v <= hi:
+                grid.append(v)
+        dec *= 10
+    grid.append(lo)
+    grid.append(hi)
+    return sorted(set(grid))
+
+
+def _test_broke(out, test_name):
+    """Did `test_name` FAIL (invariant violated) in this forge output? True=broke, False=held,
+    None=couldn't tell (e.g. compile error / test not found)."""
+    for line in (out or "").splitlines():
+        if test_name in line:
+            if "[FAIL" in line:
+                return True
+            if "[PASS" in line:
+                return False
+    return None
+
+
+def _materiality_verdict(results, material):
+    """results: list of (magnitude, broke). Returns (verdict, exit_code, breaking_magnitudes).
+    DUST-ONLY (exit 2) == breaks only BELOW the materiality threshold -> likely a bad invariant."""
+    breaking = [m for m, b in results if b is True]
+    if not breaking:
+        return "HELD", 0, []
+    if max(breaking) >= int(material):
+        return "MATERIAL", 0, breaking
+    return "DUST-ONLY", 2, breaking
+
+
+def cmd_materiality(args):
+    """Replay an invariant reproducer at escalating input scales to separate a REAL bug from a
+    dust-only rounding artifact (a BAD-INVARIANT false positive — guidance/07 filter 3).
+
+    The reproducer test must read its per-run amount from an env var (default FUZZPIPE_SWEEP_AMOUNT),
+    e.g. `uint256 amount = vm.envOr("FUZZPIPE_SWEEP_AMOUNT", uint256(1));`, run the exploit at that
+    amount, and assert the invariant (a revert = the invariant is violated at that scale). It should
+    return early (pass) when `amount` is out of usable range so only a genuine violation fails.
+
+    Exit 2 = the invariant breaks ONLY below the materiality threshold -> tighten it (bad invariant)."""
+    target = Path(args.target).resolve()
+    if not have("forge"):
+        err("forge is required for the materiality sweep. Install: " + TOOLS["forge"][1])
+        return 2
+    lo, hi, material = _parse_amount(args.min), _parse_amount(args.max), _parse_amount(args.material)
+    grid = _log_grid(lo, hi)
+    info("Materiality sweep of `%s` over %d scales [%d .. %d]; material threshold = %d"
+         % (args.test, len(grid), grid[0], grid[-1], material))
+    results = []
+    for m in grid:
+        rc, out = proc.run_bounded(["forge", "test", "--match-test", args.test],
+                                   args.budget, cwd=str(target), env={args.env: m})
+        broke = _test_broke(out, args.test)
+        results.append((m, broke))
+        mark = c("BROKE", "red") if broke else (c("held ", "green") if broke is False else c("?    ", "yellow"))
+        print("  %-26d %s" % (m, mark))
+    verdict, code, breaking = _materiality_verdict(results, material)
+    print()
+    if verdict == "HELD":
+        ok("Invariant HELD at every scale in the sweep — not falsified here.")
+    elif verdict == "MATERIAL":
+        warn("Invariant BREAKS at a MATERIAL scale (largest break %d >= %d). GENUINE candidate — "
+             "triage as a real bug (guidance/04)." % (max(breaking), material))
+    else:
+        warn("Invariant breaks ONLY below the materiality threshold (largest break %d < %d). This is "
+             "the dust-rounding signature of a BAD INVARIANT (false positive): do NOT report it; add a "
+             "materiality bound to the invariant (guidance/07 filter 3)." % (max(breaking), material))
+    set_stage(target, "5-materiality", test=args.test, verdict=verdict)
+    return code
+
+
+# ------------------------------------------------------------------------------------- ir
+
+
+import re as _re_mod   # local alias; the file otherwise avoids a module-level re import
+
+_FUNC_HEAD_RE = _re_mod.compile(r"\bfunction\s+(\w+)\s*\(")
+_VAR_RE = _re_mod.compile(
+    r"\b(?:uint\d*|int\d*|address|bool|bytes\d*|string|mapping\s*\([^)]*\))\s+public\s+"
+    r"(?:constant\s+|immutable\s+)?(\w+)")
+_PRIV_MODS = ("onlyOwner", "onlyRole", "onlyAdmin", "onlyGovernance", "onlyGovernor",
+              "onlyKeeper", "onlyManager", "onlyGuardian", "restricted", "auth")
+_SKIP_SRC_PARTS = ("/test/", "/tests/", "/recon/", "/lib/", "/mock", "/mocks/", "/script/",
+                   "/node_modules/", "/foundry-repro/")
+
+
+def _src_dirs(target, pt, override=None):
+    if override:
+        return [Path(target) / override]
+    if pt == "hardhat":
+        return [Path(target) / "contracts"]
+    return [Path(target) / "src"]
+
+
+def _iter_functions(text):
+    """Yield (name, modifier_tail) for each function, extracting the argument list by BALANCED
+    parens so a `returns (...)` clause is not swallowed into the args (which would drop the
+    function's visibility from the tail and under-report the surface — a false-pass bug)."""
+    for m in _FUNC_HEAD_RE.finditer(text):
+        name = m.group(1)
+        depth, j = 0, m.end() - 1                      # j at the opening '('
+        while j < len(text):
+            if text[j] == "(":
+                depth += 1
+            elif text[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        k, tail = j + 1, []                            # from after ')' to the next '{' or ';'
+        while k < len(text) and text[k] not in "{;":
+            tail.append(text[k]); k += 1
+        yield name, "".join(tail)
+
+
+def _scan_solidity_surface(target, pt, override=None):
+    """Best-effort (regex, no compiler) extraction of the protocol's attack surface:
+    state-mutating external/public functions, public state variables, and privileged functions.
+    Deliberately mechanical — the CLI never reasons; it just enumerates what the IR must cover."""
+    entry_points, state_vars, privileged = set(), set(), set()
+    for base in _src_dirs(target, pt, override):
+        if not base.is_dir():
+            continue
+        for sol in base.rglob("*.sol"):
+            p = "/" + str(sol).replace("\\", "/").lstrip("/")
+            if any(s in p for s in _SKIP_SRC_PARTS):
+                continue
+            try:
+                text = sol.read_text(errors="replace")
+            except Exception:
+                continue
+            # strip comments so a doc-comment like "call the function foo()" cannot create a phantom
+            # entry point / state var (which would demand coverage of code that doesn't exist)
+            text = _re_mod.sub(r"/\*.*?\*/", " ", text, flags=_re_mod.S)
+            text = "\n".join(ln[:ln.find("//")] if "//" in ln else ln for ln in text.splitlines())
+            for name, tail in _iter_functions(text):
+                if name == "constructor":
+                    continue
+                if not _re_mod.search(r"\b(external|public)\b", tail):
+                    continue
+                if _re_mod.search(r"\b(view|pure)\b", tail):
+                    continue                              # not a state-mutating entry point
+                entry_points.add(name)
+                if any(mod in tail for mod in _PRIV_MODS):
+                    privileged.add(name)
+            for m in _VAR_RE.finditer(text):
+                state_vars.add(m.group(1))
+    return entry_points, state_vars, privileged
+
+
+def _ir_referenced_tokens(invs):
+    """Every identifier an invariant set 'touches' — target suffixes + predicate/statement tokens —
+    so the audit can decide whether a surface element is covered by >= 1 invariant."""
+    toks = set()
+    auth_toks = set()
+    for i in invs:
+        local = set()
+        for t in (i.targets or []):
+            local.add(str(t).split(".")[-1])
+            local.add(str(t))
+        expr = (i.predicate or {}).get("expr", "") if isinstance(i.predicate, dict) else ""
+        for blob in (expr, i.statement or ""):
+            local.update(_re_mod.findall(r"[A-Za-z_]\w*", blob))
+        toks.update(local)
+        if i.shape == "AUTHORIZATION" or i.category == "anti-property":
+            auth_toks.update(local)
+    return toks, auth_toks
+
+
+def _load_waivers(target, override=None):
+    f = Path(override) if override else (state_dir(target) / "coverage-waivers.json")
+    if not f.exists():
+        return {}
+    try:
+        data = json.loads(f.read_text())
+        return {k: v for k, v in data.items() if isinstance(v, str) and v.strip()}
+    except Exception:
+        return {}
+
+
+def cmd_ir_coverage_audit(args):
+    """Machine-enforced completeness gate: every state-mutating entry point / public state var is
+    covered by >= 1 IR invariant, and every privileged function has >= 1 AUTHORIZATION/anti-property
+    invariant — or carries a justified waiver in .fuzzpipe/coverage-waivers.json. Exit 2 on an
+    unwaived gap (the same actionable loop-back signal as `coverage`)."""
+    target = Path(args.target).resolve()
+    pt = _project_type(target, getattr(args, "project_type", None))
+    invs = irmod.load(state_dir(target) / "invariants.json")
+    if not invs:
+        err("no IR at %s. Author invariants and `fuzzpipe ir put` them first." % (state_dir(target) / "invariants.json"))
+        return 1
+    entry_points, state_vars, privileged = _scan_solidity_surface(target, pt, getattr(args, "src", None))
+    if not entry_points and not state_vars:
+        warn("no Solidity surface found under %s — pass --src <dir> if sources live elsewhere."
+             % ", ".join(str(d) for d in _src_dirs(target, pt, getattr(args, "src", None))))
+        return 1
+    toks, auth_toks = _ir_referenced_tokens(invs)
+    waivers = _load_waivers(target, getattr(args, "waivers", None))
+
+    gaps = []   # (kind, name)
+    for fn in sorted(entry_points):
+        if fn not in toks and fn not in waivers:
+            gaps.append(("entry-point", fn))
+    for v in sorted(state_vars):
+        if v not in toks and v not in waivers:
+            gaps.append(("state-var", v))
+    for fn in sorted(privileged):
+        if fn not in auth_toks and fn not in waivers:
+            gaps.append(("privileged-no-authz", fn))
+
+    print(c("\nIR coverage audit (%s)" % target.name, "bold"))
+    print("  entry points: %d   state vars: %d   privileged: %d   invariants: %d"
+          % (len(entry_points), len(state_vars), len(privileged), len(invs)))
+    if waivers:
+        print("  waived: %s" % ", ".join(sorted(waivers)))
+    if not gaps:
+        ok("Completeness gate PASSED — every surface element is covered by an invariant or waived.")
+        set_stage(target, "2-coverage-audit", gaps=0)
+        return 0
+    warn("%d coverage GAP(s) — a whole bug class may be invisible to the campaign:" % len(gaps))
+    for kind, name in gaps:
+        print("    [%s] %s" % (c(kind, "red"), name))
+    warn("Fix Stage 2 (add invariants) or record a justified waiver in "
+         ".fuzzpipe/coverage-waivers.json ({\"%s\": \"why it is safe to skip\"})." % gaps[0][1])
+    set_stage(target, "2-coverage-audit", gaps=len(gaps))
+    return 2
+
+
+def cmd_ir(args):
+    target = Path(args.target).resolve()
+    path = state_dir(target) / "invariants.json"
+    action = args.action
+    if action == "coverage-audit":
+        return cmd_ir_coverage_audit(args)
+    if action == "put":
+        if not args.file:
+            err("`ir put` needs --file <ir.json>")
+            return 1
+        raw = json.loads(Path(args.file).read_text())
+        raw = raw.get("invariants", raw) if isinstance(raw, dict) else raw
+        invs = [irmod.Invariant.from_dict(d) for d in raw]
+        errs = irmod.validate(invs)
+        if errs:
+            err("IR validation failed - not saved:")
+            for e in errs:
+                print("  - " + e)
+            return 1
+        irmod.dump(path, invs)
+        ok("stored %d invariant(s) to %s" % (len(invs), path))
+        return 0
+    invs = irmod.load(path)
+    if action == "validate":
+        errs = irmod.validate(invs)
+        if errs:
+            err("IR invalid:")
+            for e in errs:
+                print("  - " + e)
+            return 1
+        ok("IR valid (%d invariant(s))." % len(invs))
+        return 0
+    if action == "list":
+        for i in invs:
+            print("  %-18s [%s/%s/%s] tier%d %-9s %s"
+                  % (i.id, i.category, i.shape, i.scope, i.tier_hint, i.status, i.statement[:60]))
+        return 0
+    if action == "get":
+        for i in invs:
+            if i.id == args.id:
+                print(json.dumps(irmod.asdict(i), indent=2))
+                return 0
+        err("no invariant with id %s" % args.id)
+        return 1
+    if action == "candidates":
+        for i in invs:
+            if i.status == "candidate":
+                print("  %-18s %s" % (i.id, i.statement[:70]))
+        return 0
+    err("unknown ir action: %s" % action)
+    return 1
+
+
+# --------------------------------------------------------------------------------- coverage
+
+
+def _cov_in_scope(sf):
+    """A source path that counts toward protocol coverage (not lib/test/recon/repro). Normalizes so
+    a RELATIVE path (`lib/forge-std/...`, emitted by forge coverage) is excluded like an absolute one."""
+    if not sf.endswith(".sol"):
+        return False
+    norm = sf if sf.startswith("/") else "/" + sf
+    return not any(s in norm for s in ("/lib/", "/test/", "/contracts/recon/", "/foundry-repro/"))
+
+
+def _coverage_scan(target, engine):
+    """Parse the engine's lcov into in-scope per-file coverage. Returns (scope, err_message):
+    scope is {file: {funcs, la, lh}} for in-scope files, or (None, message) when there is no lcov
+    or nothing in scope. Shared by `cmd_coverage` and the run-time coverage gate."""
+    lcov = state_dir(target) / "corpus" / engine / "coverage" / "lcov.info"
+    if not lcov.exists():
+        return None, ("no coverage at %s. Run `fuzzpipe run --engine %s` first (coverage must be "
+                      "enabled)." % (lcov, engine))
+    files, cur = {}, None
+    for line in lcov.read_text().splitlines():
+        if line.startswith("SF:"):
+            cur = line[3:]
+            files[cur] = {"funcs": {}, "la": 0, "lh": 0}
+        elif line.startswith("FNDA:") and cur:
+            hits, name = line[5:].split(",", 1)
+            files[cur]["funcs"][name] = int(hits)
+        elif line.startswith("DA:") and cur:
+            _, cnt = line[3:].split(",")
+            files[cur]["la"] += 1
+            if int(cnt) > 0:
+                files[cur]["lh"] += 1
+    scope = {sf: d for sf, d in files.items() if _cov_in_scope(sf)}
+    if not scope:
+        return None, "no in-scope source files found in coverage (only lib/test)."
+    return scope, None
+
+
+def _uncovered_functions(scope):
+    """List of 'file::fn' for every in-scope function with zero hits."""
+    out = []
+    for sf in sorted(scope):
+        name = sf.split("/")[-1]
+        for fn, hits in sorted(scope[sf]["funcs"].items()):
+            if hits == 0:
+                out.append("%s::%s" % (name, fn))
+    return out
+
+
+def _overall_pct(scope):
+    la = sum(d["la"] for d in scope.values())
+    lh = sum(d["lh"] for d in scope.values())
+    return (100 * lh // la) if la else 0
+
+
+def _cov_waived(entry, waivers):
+    """True if a 'file::fn' uncovered entry is waived — by the exact key or by the bare fn name."""
+    return entry in waivers or entry.split("::")[-1] in waivers
+
+
+def _min_pct_config(target):
+    """Configured minimum in-scope line-% for the run-time gate (config coverage.min_pct, default 0
+    = pct never fails on its own; the gate still blocks on unwaived uncovered entry points)."""
+    cov = (load_config(target).get("coverage") or {})
+    try:
+        return int(cov.get("min_pct") or 0)
+    except Exception:
+        return 0
+
+
+def _coverage_gate(target, engine, min_pct, waivers):
+    """Evaluate the hard coverage gate. Returns (available, passed, reasons):
+      available=False when there is no lcov to judge (caller treats as 'not yet measurable');
+      passed=False with reasons when an unwaived entry point is MISS or overall % < min_pct."""
+    scope, msg = _coverage_scan(target, engine)
+    if scope is None:
+        return False, False, [msg]
+    reasons = []
+    unwaived = [u for u in _uncovered_functions(scope) if not _cov_waived(u, waivers)]
+    if unwaived:
+        reasons.append("%d uncovered entry point(s): %s"
+                       % (len(unwaived), ", ".join(unwaived[:8]) + (" ..." if len(unwaived) > 8 else "")))
+    pct = _overall_pct(scope)
+    if min_pct and pct < min_pct:
+        reasons.append("in-scope line coverage %d%% < required %d%%" % (pct, min_pct))
+    return True, (not reasons), reasons
+
+
+def cmd_coverage(args):
+    target = Path(args.target).resolve()
+    scope, msg = _coverage_scan(target, args.engine)
+    if scope is None:
+        # "no in-scope files" is a soft warn; "no lcov" is an error — both exit 1 (no false 'covered')
+        (warn if "in-scope" in msg else err)(msg)
+        return 1
+    gate = getattr(args, "gate", False)
+    min_pct = getattr(args, "min_pct", 0) or 0
+    waivers = _load_waivers(target, None) if gate else {}
+    uncovered = _uncovered_functions(scope)
+    print(c("\nCoverage report (%s)" % args.engine, "bold"))
+    for sf in sorted(scope):
+        d = scope[sf]
+        la, lh = d["la"], d["lh"]
+        pct = (100 * lh // la) if la else 0
+        name = sf.split("/")[-1]
+        color = "green" if pct >= 80 else ("yellow" if pct >= 40 else "red")
+        print("\n  %s  lines %d/%d (%s)" % (c(name, "bold"), lh, la, c(str(pct) + "%", color)))
+        for fn, hits in sorted(d["funcs"].items()):
+            waived = gate and _cov_waived("%s::%s" % (name, fn), waivers)
+            mark = c("ok ", "green") if hits > 0 else (c("waiv", "yellow") if waived else c("MISS", "red"))
+            print("    [%s] %-30s hits=%d" % (mark, fn, hits))
+    print()
+    overall = _overall_pct(scope)
+
+    if gate:
+        unwaived = [u for u in uncovered if not _cov_waived(u, waivers)]
+        reasons = []
+        if unwaived:
+            reasons.append("%d uncovered entry point(s): %s" % (len(unwaived), ", ".join(unwaived)))
+        if min_pct and overall < min_pct:
+            reasons.append("in-scope line coverage %d%% < required %d%%" % (overall, min_pct))
+        if reasons:
+            warn("COVERAGE GATE FAILED (%d%% in-scope lines):" % overall)
+            for r in reasons:
+                print("    - " + r)
+            warn("Raise coverage (`fuzzpipe gen-handlers`, loosen clamps) or record a justified "
+                 "waiver in .fuzzpipe/coverage-waivers.json, then re-run.")
+            set_stage(target, "5-coverage", gate="fail", pct=overall, uncovered=len(unwaived))
+            return 2
+        ok("COVERAGE GATE PASSED — %d%% in-scope lines, every entry point hit or waived." % overall)
+        set_stage(target, "5-coverage", gate="pass", pct=overall, uncovered=0)
+        return 0
+
+    # default (non-gate) behavior — unchanged: any uncovered in-scope function is the loop-back signal
+    if uncovered:
+        warn("%d function(s) NEVER exercised by the campaign:" % len(uncovered))
+        for u in uncovered:
+            print("    - " + u)
+        warn("LOOP-BACK SIGNAL: uncovered entry points mean the harness is incomplete. "
+             "Add/loosen handlers (Stage 3) before trusting any 'passed' result.")
+        set_stage(target, "5-coverage", uncovered=len(uncovered))
+        return 2
+    ok("All in-scope functions were exercised. Coverage looks healthy.")
+    set_stage(target, "5-coverage", uncovered=0)
+    return 0
+
+
+# --------------------------------------------------------------------------------- status
+
+
+def cmd_status(args):
+    target = Path(args.target).resolve()
+    st = load_state(target)
+    if not st:
+        warn("no run state - run `fuzzpipe init --target <path>` first.")
+        return 1
+    print(c("fuzzpipe v2.2 status", "bold"))
+    print("  target : %s" % target)
+    print("  stage  : %s" % st.get("stage", "?"))
+    print("  updated: %s" % st.get("updated", "?"))
+    invs = irmod.load(state_dir(target) / "invariants.json")
+    if invs:
+        print("  IR     : %d invariant(s)" % len(invs))
+    for h in st.get("history", [])[-8:]:
+        print("    - %s  %s" % (h.get("at", "")[:19], h.get("stage", "")))
+    return 0
+
+
+# --------------------------------------------------------------------------------- selftest
+
+
+def cmd_selftest(args):
+    import unittest
+    tests_dir = PROJECT_ROOT / "tests"
+    if not tests_dir.exists():
+        err("no tests/ directory found at %s" % tests_dir)
+        return 1
+    sys.path.insert(0, str(tests_dir))
+    sys.path.insert(0, str(PROJECT_ROOT / "cli"))
+    loader = unittest.TestLoader()
+    suite = loader.discover(str(tests_dir), pattern="test_*.py")
+    verbosity = 2 if getattr(args, "verbose", False) else 1
+    result = unittest.TextTestRunner(verbosity=verbosity).run(suite)
+    if result.testsRun == 0:
+        err("selftest discovered 0 tests — the suite is not being collected (a silent 'pass').")
+        return 1
+    return 0 if result.wasSuccessful() else 1
+
+
+# ------------------------------------------------------------------------------------ main
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="fuzzpipe", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add_target(x):
+        x.add_argument("--target", "-t", default=".", help="path to the Solidity project")
+
+    def add_ptype(x):
+        x.add_argument("--project-type", choices=["foundry", "hardhat"], default=None,
+                       help="override project-type autodetection")
+
+    sp = sub.add_parser("doctor", help="check installed tools (never crashes on a missing tool)")
+    add_target(sp)
+    sp.set_defaults(func=cmd_doctor)
+
+    sp = sub.add_parser("init", help="create run state for a target"); add_target(sp); add_ptype(sp)
+    sp.set_defaults(func=cmd_init)
+
+    sp = sub.add_parser("scaffold", help="generate Chimera harness"); add_target(sp); add_ptype(sp)
+    sp.add_argument("--force", action="store_true", help="regenerate even if recon/ exists")
+    sp.add_argument("--offline", action="store_true", help="skip network fetches; vendoring failures are non-fatal")
+    sp.set_defaults(func=cmd_scaffold)
+
+    sp = sub.add_parser("build", help="compile harness"); add_target(sp); add_ptype(sp)
+    sp.set_defaults(func=cmd_build)
+
+    sp = sub.add_parser("gen-handlers",
+                        help="auto-generate a COMPLETE ABI-driven handler surface (run after build)")
+    add_target(sp); add_ptype(sp)
+    sp.add_argument("--contract", help="restrict generation to one contract type")
+    sp.add_argument("--src", help="source dir for privileged-function detection (default src/ or contracts/)")
+    sp.add_argument("--force", action="store_true", help="overwrite TargetFunctionsAuto.sol")
+    sp.set_defaults(func=cmd_gen_handlers)
+
+    sp = sub.add_parser("verify-harness", help="preflight: assert the engine discovers the harness")
+    add_target(sp); add_ptype(sp)
+    sp.set_defaults(func=cmd_verify_harness)
+
+    sp = sub.add_parser("run", help="run the tiered ladder (or one --engine)"); add_target(sp); add_ptype(sp)
+    sp.add_argument("--engine", "-e", choices=["medusa", "echidna", "foundry", "halmos"], default=None,
+                    help="run a single engine (backward-compatible). Omit to run the tiered ladder.")
+    sp.add_argument("--max-tier", type=int, default=1, help="highest ladder tier to run (0..2)")
+    sp.add_argument("--depth", type=int, default=64, help="sequence length / depth")
+    sp.add_argument("--limit", type=int, default=100000, help="test limit / runs")
+    sp.add_argument("--budget", type=int, default=600, help="tier-1 wall-clock budget (seconds); "
+                    "tier-0/2 come from .fuzzpipe/config.json `budgets` (defaults 60/900)")
+    sp.add_argument("--property", help="focus a single property_* (foundry/halmos)")
+    sp.add_argument("--regen-config", action="store_true", help="overwrite existing engine config")
+    sp.add_argument("--workers", type=int, default=None,
+                    help="Medusa internal worker (goroutine) count; default from config (%d)"
+                    % DEFAULT_MEDUSA_WORKERS)
+    sp.add_argument("--jobs", "-j", type=int, default=None,
+                    help="max CONCURRENT campaigns in Tier-1 (per-invariant shards + engines); "
+                    "default auto (cpu-2)")
+    sp.add_argument("--no-parallel", action="store_true",
+                    help="disable per-invariant fan-out; run one shared medusa campaign")
+    sp.set_defaults(func=cmd_run)
+
+    sp = sub.add_parser("triage", help="broken sequences -> type-aware reproducer + verdict gate")
+    add_target(sp); add_ptype(sp)
+    sp.set_defaults(func=cmd_triage)
+
+    sp = sub.add_parser("verify", help="verdict gate on one PoC: compile+reproduce+harm -> CONFIRMED/SUSPECTED")
+    add_target(sp)
+    sp.add_argument("--ce", help="counterexample id (used as the invariant marker if --marker omitted)")
+    sp.add_argument("--poc", help="path to the reproducer .t.sol (for the harm-assertion check)")
+    sp.add_argument("--test", help="forge --match-test name (default: test_repro)")
+    sp.add_argument("--marker", help="invariant-specific revert marker to require in the failure")
+    sp.set_defaults(func=cmd_verify)
+
+    sp = sub.add_parser("materiality",
+                        help="sweep a reproducer across input scales: dust-only break => bad invariant (FP)")
+    add_target(sp)
+    sp.add_argument("--test", required=True, help="forge test fn that reads the amount from --env and asserts the invariant")
+    sp.add_argument("--min", default="1", help="smallest sweep amount (int or 1e18 form; default 1)")
+    sp.add_argument("--max", default="1e24", help="largest sweep amount (default 1e24)")
+    sp.add_argument("--material", default="1e9",
+                    help="materiality threshold in base units — smallest economically meaningful amount (default 1e9)")
+    sp.add_argument("--env", default="FUZZPIPE_SWEEP_AMOUNT", help="env var the test reads the amount from")
+    sp.add_argument("--budget", type=int, default=120, help="per-scale forge wall-clock budget (seconds)")
+    sp.set_defaults(func=cmd_materiality)
+
+    sp = sub.add_parser("ir", help="typed Invariant IR: put/get/list/validate/candidates/coverage-audit")
+    add_target(sp); add_ptype(sp)
+    sp.add_argument("action", choices=["put", "get", "list", "validate", "candidates", "coverage-audit"])
+    sp.add_argument("--file", help="ir.json for `put`")
+    sp.add_argument("--id", help="invariant id for `get`")
+    sp.add_argument("--src", help="source dir for `coverage-audit` (default src/ or contracts/)")
+    sp.add_argument("--waivers", help="waivers json for `coverage-audit` "
+                    "(default .fuzzpipe/coverage-waivers.json)")
+    sp.set_defaults(func=cmd_ir)
+
+    sp = sub.add_parser("coverage", help="per-function coverage + uncovered-entry-point flags")
+    sp.add_argument("--gate", action="store_true",
+                    help="blocking gate: fail (exit 2) on unwaived uncovered entry points or <--min-pct")
+    sp.add_argument("--min-pct", type=int, default=0,
+                    help="minimum in-scope line %% required by --gate (default 0 = MISS-only)")
+    add_target(sp)
+    sp.add_argument("--engine", "-e", choices=["medusa", "echidna"], default="medusa")
+    sp.set_defaults(func=cmd_coverage)
+
+    sp = sub.add_parser("status", help="show pipeline state"); add_target(sp)
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("selftest", help="run the shipped regression suite (zero deps)")
+    sp.add_argument("--verbose", "-v", action="store_true")
+    sp.set_defaults(func=cmd_selftest)
+
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
